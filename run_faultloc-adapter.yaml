@@ -9,7 +9,10 @@ environment:
   type: docker
   # type: daytona
   force_build: true
-  delete: true
+  # delete: true runs `docker compose down --rmi local` on teardown, which deletes
+  # every image in the stack -- including the digest-pinned ARVO base (~3GB) and the
+  # agent image. Only compose tasks hit that path, so it is easy to miss. Keep false.
+  delete: false
   # env:
   #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
   #   ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL}

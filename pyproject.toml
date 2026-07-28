@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "Jianhong Tu" }
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = []
 
 [project.scripts]
@@ -18,3 +18,8 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-name = "faultloc_adapter"
+
+[dependency-groups]
+dev = [
+    "harbor==0.20.0",
+]

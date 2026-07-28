@@ -9,10 +9,10 @@ in the Harbor format at the configured output directory.
 import argparse
 from pathlib import Path
 
-from .adapter import FLBenchAdapter
+from .adapter import CONFIGS, DEFAULT_AGENT_IMAGE, FLBenchAdapter
 
 # Default output dir: <repo>/datasets/<adapter_id>
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[4] / "datasets" / "faultloc-adapter"
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "datasets" / "faultloc-adapter"
 
 
 def main() -> None:
@@ -40,6 +40,24 @@ def main() -> None:
         default=None,
         help="Only generate these task IDs",
     )
+    parser.add_argument(
+        "--manifest-dir",
+        type=Path,
+        default=None,
+        help="Directory of frozen instance manifests (default: <repo>/manifests)",
+    )
+    parser.add_argument(
+        "--configs",
+        nargs="+",
+        default=None,
+        choices=sorted(CONFIGS),
+        help="Benchmark configs to generate (default: all)",
+    )
+    parser.add_argument(
+        "--agent-image",
+        default=DEFAULT_AGENT_IMAGE,
+        help="Image the agent runs in (contains no source, PoC or reproducer)",
+    )
     args = parser.parse_args()
 
     adapter = FLBenchAdapter(
@@ -47,6 +65,9 @@ def main() -> None:
         overwrite=args.overwrite,
         limit=args.limit,
         task_ids=args.task_ids,
+        manifest_dir=args.manifest_dir,
+        configs=args.configs,
+        agent_image=args.agent_image,
     )
 
     adapter.run()
