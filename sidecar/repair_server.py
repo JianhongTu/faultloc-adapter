@@ -101,16 +101,16 @@ def _run(cmd, timeout, cwd="/"):
 def _sync_tree():
     """Replace the build tree with the agent's tree, from scratch.
 
-    The wipe is not an optimization to remove later -- it is what makes repeat
-    compiles work. Keeping prior build output around looks like a free incremental
-    build, but oss-fuzz build scripts are written to run once in a fresh image and
-    are not all idempotent: miniz's does a bare `mkdir build` and fails on the
-    second call with "File exists". The agent compiles in a loop, so that lands on
-    every call after the first, and the verifier's own compile is never the first.
+    The wipe makes the invariant exact rather than approximate: the tree that gets
+    built is byte-for-byte the tree the agent has, with nothing left over from the
+    image or an earlier call.
 
-    Wiping also makes the invariant exact rather than approximate: the tree that
-    gets built is byte-for-byte the tree the agent has, with no residue from an
-    earlier attempt. Full rebuilds cost 3-52s across the frozen instances
+    It is also the only thing that makes a second compile possible at all. OSS-Fuzz
+    build scripts are written to run once in a fresh image and are not all
+    idempotent -- miniz's does a bare `mkdir build` and fails with "File exists" on
+    the second call. One compile per trial is the current design, so nothing
+    depends on that today, but any retry or return to an iterating agent would hit
+    it immediately. Full rebuilds cost 3-161s across the frozen instances
     (scripts/repair_profile.py), which is not worth trading correctness for.
     """
     return _run(

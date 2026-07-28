@@ -16,6 +16,11 @@ report section and the task identity. `gold` is a calibration ceiling, not a
 forecast: its locations come from the developer patch, so an agent that fixes
 where the developer fixed scores attributable almost by construction.
 
+The agent gets ONE attempt and no build tool. Fix probability is measured over
+repeated rollouts (`n_attempts`) and verified afterwards, which keeps the
+measurement on whether the agent understood the defect rather than on how long it
+was willing to iterate against a pass/fail oracle.
+
 See README.md for the shared design constraints; sidecar/repair_server.py for
 why the build tree is synced rather than shared.
 """
@@ -122,36 +127,17 @@ def _staging_command(project: str) -> str:
             "git -c user.email=harbor@local -c user.name=harbor "
             "commit -q --allow-empty -m 'harbor baseline'",
             f"git tag {BASELINE_TAG}",
-            # Written here rather than baked into the agent image so the image
-            # stays shared with the localization task.
-            "cat > /usr/local/bin/compile.sh <<'CEOF'",
-            _COMPILE_SH,
-            "CEOF",
-            "chmod +x /usr/local/bin/compile.sh",
+            # Deliberately no compile tool. The agent gets one attempt: it reads,
+            # diagnoses and edits, and the verifier builds afterwards. Fix
+            # probability is then measured over repeated rollouts rather than over
+            # one agent's willingness to iterate, and an agent cannot converge on
+            # "the PoC stopped crashing" without understanding why.
             # Signal completion last: `docker compose up --wait` returns when the
             # container is *running*, not when this script finishes.
             f"touch {STAGED_SENTINEL}",
             "exec sleep infinity",
         ]
     )
-
-
-_COMPILE_SH = """#!/bin/sh
-# Rebuild the project from your working tree at /workspace/src.
-# Exit 0 means the build succeeded. Anything else is a build failure; the
-# compiler output is printed so you can fix it.
-exec python3 - "$@" <<'PY'
-import json, sys, urllib.request
-req = urllib.request.Request("http://poc:8080/compile", method="POST", data=b"")
-with urllib.request.urlopen(req, timeout=2000) as resp:
-    r = json.loads(resp.read())
-if r.get("sync_failed"):
-    sys.stderr.write("infrastructure error: could not sync the source tree\\n")
-    sys.exit(70)
-sys.stdout.write(r.get("output", ""))
-sys.exit(r.get("exit_code", 1))
-PY
-"""
 
 
 def _instruction(manifest: dict, config: str, report: dict | None) -> str:
@@ -271,8 +257,8 @@ sanitizer = "{manifest['sanitizer']}"
 condition = "{config}"
 
 [agent]
-# Larger than localization's: the agent compiles and re-runs the PoC in a loop.
-timeout_sec = 3600.0
+# Same as localization's: the agent reads and edits, it does not build.
+timeout_sec = 1800.0
 network_mode = "allowlist"
 allowed_hosts = [{hosts}]
 
@@ -306,9 +292,9 @@ memory_mb = 8192
 
         return f"""# Same split as the localization task: the agent runs in `main` with no ARVO
 # content of its own, and the build tree, reproducer and toolchain stay in the
-# `poc` sidecar. The agent edits /workspace/src and reaches compile.sh and
-# run_poc.sh over HTTP; the sidecar syncs that tree onto /src/{project} before
-# each build, so what compiles is exactly what the agent wrote.
+# `poc` sidecar. The agent edits /workspace/src and has run_poc.sh for evidence;
+# it gets no build tool. The verifier syncs that tree onto /src/{project} and
+# builds it afterwards, so what compiles is exactly what the agent wrote.
 services:
   main:
     init: true

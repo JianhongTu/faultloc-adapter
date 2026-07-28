@@ -10,9 +10,9 @@ Two task families are generated from the same frozen instances:
   source tree plus crash evidence and writes `prediction.json`, a list of suspicious
   spans, scored against ground truth from the cleaned developer patch. No build.
 - **repair** (`repair__<id>-<condition>`) — the agent diagnoses *and fixes* the
-  vulnerability, then the verifier rebuilds from the agent's own tree and re-runs the
-  reproducer. Measures whether an external root-cause report beats the same agent's
-  self-diagnosis.
+  vulnerability in **one attempt with no build tool**, then the verifier rebuilds from
+  the agent's own tree and re-runs the reproducer. Measures whether an external
+  root-cause report beats the same agent's self-diagnosis.
 
 **Status:** all gates passing. Localization — scorer parity (10,508/10,508 archived
 predictions re-score identically on all six metrics), config boundaries (4/4), controls
@@ -120,12 +120,19 @@ One localization task per `(instance, config)` for the four FLBench configs `mai
 - **Scorer** — `src/faultloc_adapter/scorer/` is a verbatim copy of `flbench.eval`.
   **Do not edit it**; parity is meaningless if the metric is reimplemented. Re-vendor.
 
-Repair adds `/compile` (`sidecar/repair_server.py`) and two agent-facing scripts,
-`compile.sh` and `run_poc.sh`. The toolchain stays in the sidecar: on each build it
-replaces `/src/<project>` with the agent's tree, so what compiles is exactly what the agent
-wrote, and build output never touches the tmpfs volume. The patch is captured as
-`git diff` against a `harbor-baseline` tag written over the staged tree before the agent
-starts, which catches committed, staged, unstaged and newly created files in one diff.
+Repair adds a `/compile` endpoint (`sidecar/repair_server.py`) that only the **verifier**
+calls. The agent has `run_poc.sh` for evidence and no build tool at all: it reads,
+diagnoses, edits, and exits, and the build happens afterwards. Fix probability comes from
+repeated rollouts (`n_attempts`), which keeps the measurement on whether the agent
+understood the defect rather than on how long it iterated against a pass/fail oracle.
+`run_poc.sh` runs the pre-existing binary and never reflects the agent's edits — the prompt
+says so explicitly, since silently letting an agent believe otherwise would be misleading.
+
+Before building, the sidecar replaces `/src/<project>` with the agent's tree, so what
+compiles is exactly what the agent wrote and build output never touches the tmpfs volume.
+The patch is captured as `git diff` against a `harbor-baseline` tag written over the staged
+tree before the agent starts, which catches committed, staged, unstaged and newly created
+files in one diff.
 
 ### Rewards
 
@@ -160,6 +167,10 @@ applicable — filter on that rather than reading them as zeros.
 
 `gold` is a ceiling, not a forecast: its locations are derived from the developer patch, so
 an agent that fixes where the developer fixed is attributable almost by construction.
+
+With one attempt and no build tool, a patch that is right in substance but does not compile
+scores zero. That is intended — but **report fix rate conditional on `compiled` alongside
+the unconditional rate**, or build noise is silently folded into the diagnosis result.
 
 **Aggregation deliberately differs from the reference.** FLBench *excludes* instances with
 no uploaded prediction; this verifier scores them `0` with `prediction_missing = 1`, so
@@ -211,11 +222,12 @@ run completes and the numbers look plausible.
   agent starts against a half-populated `/workspace/src`.
 - **`src/faultloc_adapter/scorer/`, a verbatim copy of `flbench.eval`.** Parity is
   meaningless if the metric is reimplemented. Re-vendor from FLBench instead of editing.
-- **The wipe in `sidecar/repair_server.py:_sync_tree`.** OSS-Fuzz build scripts are written
-  to run once in a fresh image and are not all idempotent — miniz's does a bare
-  `mkdir build` and fails with "File exists" on the second call. A repair agent compiles in
-  a loop and the verifier's compile is never the first, so keeping prior build output turns
-  every run after the first into a build failure the agent did not cause.
+- **The wipe in `sidecar/repair_server.py:_sync_tree`.** It is what makes the built tree
+  byte-for-byte the agent's tree, and the only thing that makes a *second* compile possible:
+  OSS-Fuzz build scripts run once in a fresh image and are not all idempotent — miniz's does
+  a bare `mkdir build` and fails with "File exists" on the second call. One compile per
+  trial means nothing depends on that today, but any retry, or any return to an iterating
+  agent, hits it immediately.
 
 **Never set `vm.mmap_rnd_bits` host-wide.** It is not namespaced, so it changes every other
 workload on the machine, and at 28 the msan failure cannot occur — any test of the two
