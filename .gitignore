@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Local secrets (model endpoint + key)
+.env
+
 # Generated Harbor artifacts
 datasets/
 jobs/

@@ -9,7 +9,12 @@ in the Harbor format at the configured output directory.
 import argparse
 from pathlib import Path
 
-from .adapter import CONFIGS, DEFAULT_AGENT_IMAGE, FLBenchAdapter
+from .adapter import (
+    CONFIGS,
+    DEFAULT_AGENT_IMAGE,
+    DEFAULT_ALLOWED_HOSTS,
+    FLBenchAdapter,
+)
 
 # Default output dir: <repo>/datasets/<adapter_id>
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "datasets" / "faultloc-adapter"
@@ -58,6 +63,16 @@ def main() -> None:
         default=DEFAULT_AGENT_IMAGE,
         help="Image the agent runs in (contains no source, PoC or reproducer)",
     )
+    parser.add_argument(
+        "--allowed-hosts",
+        nargs="+",
+        default=None,
+        help=(
+            "Hosts the agent may reach during agent.run() "
+            f"(default: {' '.join(DEFAULT_ALLOWED_HOSTS)}). "
+            "Must include 'poc' and the model endpoint host."
+        ),
+    )
     args = parser.parse_args()
 
     adapter = FLBenchAdapter(
@@ -68,6 +83,7 @@ def main() -> None:
         manifest_dir=args.manifest_dir,
         configs=args.configs,
         agent_image=args.agent_image,
+        allowed_hosts=args.allowed_hosts,
     )
 
     adapter.run()
