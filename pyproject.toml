@@ -1,0 +1,20 @@
+[project]
+name = "harbor-faultloc-adapter"
+version = "0.1.0"
+description = "Convert FLBench fault-localization instances into Harbor tasks"
+readme = "README.md"
+authors = [
+    { name = "Jianhong Tu" }
+]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+faultloc-adapter = "faultloc_adapter.main:main"
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "faultloc_adapter"
