@@ -4,15 +4,23 @@ Converts [FLBench](https://github.com/JianhongTu/FLBench) fault-localization ins
 into reproducible [Harbor](https://github.com/harbor-framework/harbor) tasks. Standalone,
 so FLBench never has to fork or modify Harbor.
 
-The task is **root-cause localization**: the agent inspects a vulnerable C/C++ source tree
-plus crash evidence and writes `prediction.json`, a list of suspicious spans, scored
-against ground truth from the cleaned developer patch. No build, no repair.
+Two task families are generated from the same frozen instances:
 
-**Status:** all gates passing — scorer parity (10,508/10,508 archived predictions re-score
-identically on all six metrics), config boundaries (4/4), controls (`oracle` 1.0 / `nop`
-0.0), environment sweep (17/17 instances), and live agents under Harbor producing valid
-predictions. Each is reproducible via the `scripts/` entry named below. Remaining: runtime
-profiling to pick a fast-debug subset.
+- **localization** (`faultloc__<id>-<config>`) — the agent inspects a vulnerable C/C++
+  source tree plus crash evidence and writes `prediction.json`, a list of suspicious
+  spans, scored against ground truth from the cleaned developer patch. No build.
+- **repair** (`repair__<id>-<condition>`) — the agent diagnoses *and fixes* the
+  vulnerability, then the verifier rebuilds from the agent's own tree and re-runs the
+  reproducer. Measures whether an external root-cause report beats the same agent's
+  self-diagnosis.
+
+**Status:** all gates passing. Localization — scorer parity (10,508/10,508 archived
+predictions re-score identically on all six metrics), config boundaries (4/4), controls
+(`oracle` 1.0 / `nop` 0.0), environment sweep (17/17 instances), live agents under Harbor
+producing valid predictions. Repair — controls on every instance (17/17 repair-eligible),
+condition boundaries (17/17), compile profile (17/17 build clean, 3–161 s). Each is
+reproducible via the `scripts/` entry named below. Remaining: implementation-agent
+calibration.
 
 ## Quick start
 
@@ -44,6 +52,20 @@ uv run harbor run -p datasets/faultloc-adapter/faultloc__42470093-main -a nop
 defect in the task, not the agent. Generation is deterministic and self-contained — same
 manifest, byte-identical task directory, no host paths.
 
+Repair tasks come from a second generator and have their own controls:
+
+```bash
+uv run faultloc-repair --task-ids 42508282            # -> repair__42508282-{self,gold}
+uv run harbor run -p datasets/faultloc-adapter/repair__42508282-gold -a oracle
+uv run python scripts/repair_controls.py --tasks datasets/faultloc-adapter   # every instance
+uv run python scripts/repair_boundaries.py --tasks datasets/faultloc-adapter
+```
+
+`scripts/repair_controls.py` is instance **selection**, not just a gate: an instance whose
+`oracle` does not build and suppress the PoC through the staged path cannot be scored and
+belongs out of the subset. Run it before spending anything on agents.
+`scripts/repair_profile.py` measures build wall-clock, which is what bounds a repair trial.
+
 `agent-image/Dockerfile` pins its base by digest and both CLIs by version
 (`claude-code@2.1.220`, `codex@0.145.0`). Before a calibration or main experiment, also
 freeze the built image by digest (`docker images --no-trunc --format '{{.ID}}'
@@ -73,8 +95,9 @@ directory and never copies `~/.claude/.credentials.json`.
 
 ## Task design
 
-One task per `(instance, config)` for the four FLBench configs `main`, `ablation1`,
-`ablation2`, `sanity`. Two compose services:
+One localization task per `(instance, config)` for the four FLBench configs `main`,
+`ablation1`, `ablation2`, `sanity`, and one repair task per `(instance, condition)` for
+`self` and `gold`. Both families use the same two compose services:
 
 | Service | Image | Holds |
 |---|---|---|
@@ -97,6 +120,13 @@ One task per `(instance, config)` for the four FLBench configs `main`, `ablation
 - **Scorer** — `src/faultloc_adapter/scorer/` is a verbatim copy of `flbench.eval`.
   **Do not edit it**; parity is meaningless if the metric is reimplemented. Re-vendor.
 
+Repair adds `/compile` (`sidecar/repair_server.py`) and two agent-facing scripts,
+`compile.sh` and `run_poc.sh`. The toolchain stays in the sidecar: on each build it
+replaces `/src/<project>` with the agent's tree, so what compiles is exactly what the agent
+wrote, and build output never touches the tmpfs volume. The patch is captured as
+`git diff` against a `harbor-baseline` tag written over the staged tree before the agent
+starts, which catches committed, staged, unstaged and newly created files in one diff.
+
 ### Rewards
 
 The verifier writes `/logs/verifier/reward.json`, so every metric survives as a named
@@ -110,6 +140,26 @@ Harbor reward:
 
 `reward` is the headline key Harbor reads; it mirrors `iou`. `hunk_hit` is binary so
 pass@k stays meaningful.
+
+Repair tasks emit their own contract, decomposed the same way:
+
+```json
+{"reward": 1.0, "verified": 1, "repair_ok": 1, "patch_present": 1, "compiled": 1,
+ "poc_suppressed": 1, "at_location": 1, "report_iou": 1.0, "report_hunk_recall": 1.0}
+```
+
+`repair_ok` is the plain build-and-suppress result and is emitted for **both** conditions.
+`verified` additionally requires attribution under an assisted condition, so the two arms
+score under different predicates — **compute raw repair uplift from `repair_ok`, not from
+`reward`**, or the assisted arm is penalised by a criterion the baseline never faced.
+Attribution is `report_hunk_recall > 0`: at least one hunk of the agent's patch sits at a
+reported location. It is threshold-free on purpose, and every continuous metric is stored,
+so a calibrated cutoff can replace it later without re-running anything. Under `self` there
+is no report, so `at_location` and every `report_*` metric are **-1**, meaning not
+applicable — filter on that rather than reading them as zeros.
+
+`gold` is a ceiling, not a forecast: its locations are derived from the developer patch, so
+an agent that fixes where the developer fixed is attributable almost by construction.
 
 **Aggregation deliberately differs from the reference.** FLBench *excludes* instances with
 no uploaded prediction; this verifier scores them `0` with `prediction_missing = 1`, so
@@ -161,6 +211,11 @@ run completes and the numbers look plausible.
   agent starts against a half-populated `/workspace/src`.
 - **`src/faultloc_adapter/scorer/`, a verbatim copy of `flbench.eval`.** Parity is
   meaningless if the metric is reimplemented. Re-vendor from FLBench instead of editing.
+- **The wipe in `sidecar/repair_server.py:_sync_tree`.** OSS-Fuzz build scripts are written
+  to run once in a fresh image and are not all idempotent — miniz's does a bare
+  `mkdir build` and fails with "File exists" on the second call. A repair agent compiles in
+  a loop and the verifier's compile is never the first, so keeping prior build output turns
+  every run after the first into a build failure the agent did not cause.
 
 **Never set `vm.mmap_rnd_bits` host-wide.** It is not namespaced, so it changes every other
 workload on the machine, and at 28 the msan failure cannot occur — any test of the two
