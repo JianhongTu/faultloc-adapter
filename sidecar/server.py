@@ -20,6 +20,34 @@ POC_SEARCH_PATHS = ["/tmp/poc", "/poc", "/tmp/crash", "/crash"]
 
 ADDR_NO_RANDOMIZE = 0x0040000
 
+# Attempts for the startup-crash signature below. The crash is independent per run,
+# so at the worst rate measured (~27%) five attempts leave a ~0.14% residual.
+POC_MAX_ATTEMPTS = 5
+
+# A run that reached the target prints one of these. The `arvo` wrapper is a shell
+# script, so its own "Segmentation fault" notice still lands in the captured output --
+# emptiness is not the signature, absence of a sanitizer report is.
+_SANITIZER_MARKERS = (
+    "SUMMARY:", "ERROR: AddressSanitizer", "WARNING: MemorySanitizer",
+    "ERROR: libFuzzer", "runtime error:", "Running: ",
+)
+
+def _is_startup_crash(returncode, output):
+    """True for the MSan/ASLR init crash, false for every real crash.
+
+    The target dies of SIGSEGV before libFuzzer prints its first line, so the run
+    yields no sanitizer output at all. A genuine crash -- including a genuine SEGV,
+    which several instances have -- always emits a report first.
+
+    Retrying on this signature cannot corrupt a result: a deterministic outcome
+    reproduces on every attempt and is returned unchanged, so the retry only ever
+    re-rolls an outcome that was nondeterministic to begin with.
+    """
+    # 139 when `timeout` reports the signal as 128+11; -11 if reaped directly.
+    if returncode not in (-11, 139):
+        return False
+    return not any(m in output for m in _SANITIZER_MARKERS)
+
 def _disable_aslr():
     """Turn off address-space randomization for this process and its children.
 
@@ -94,12 +122,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 timeout = int(os.environ.get("TIMEOUT", "120"))
-                r = subprocess.run(
-                    ["timeout", str(timeout), "arvo"],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    timeout=timeout + 30,
-                )
-                r.stdout = r.stdout.decode(errors="replace")
+                for attempt in range(POC_MAX_ATTEMPTS):
+                    r = subprocess.run(
+                        ["timeout", str(timeout), "arvo"],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        timeout=timeout + 30,
+                    )
+                    r.stdout = r.stdout.decode(errors="replace")
+                    if not _is_startup_crash(r.returncode, r.stdout):
+                        break
+                    # flush: the sidecar's stdout is a pipe, so buffered output would
+                    # not reach `docker compose logs` until the process exits.
+                    print("retry %d: target died during sanitizer init"
+                          % (attempt + 1), flush=True)
             except subprocess.TimeoutExpired as e:
                 r = type("r", (), {
                     "returncode": -1,

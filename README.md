@@ -25,17 +25,73 @@ Gates in [`doc/migration-parity-plan.md`](doc/migration-parity-plan.md):
 - **Environment sweep — passing.** 17/17 instances across 17 projects, 3 sanitizers and
   both languages (`doc/env-sweep-report.json`).
 
-Fixed: `run_poc.sh` used to be unreliable on msan -- 4 of 5 msan instances produced a
-symbolized report on only 1-2 of 3 attempts, versus 0 of 12 for asan and ubsan. The cause
-was ASLR, not the adapter: MSan reserves fixed shadow ranges at startup, and on hosts with
-`vm.mmap_rnd_bits=32` (Ubuntu's 6.8 kernel default) the loader intermittently lands a
-mapping inside one, killing the target with SIGSEGV before libFuzzer prints its first
-line. Measured on 42470668: 11/40 runs segfault with ASLR on, 0/40 with it off, same
-container. The sidecar now clears the randomization bit at startup and every PoC run
-inherits it; all five msan instances went 3/3 in the sweep and 20/20 under a dedicated
-100-run replay. See `sidecar/server.py:_disable_aslr`.
-
 Remaining: runtime profiling to pick the fast-debug subset.
+
+## The msan PoC flake, and why it is fixed twice
+
+`run_poc.sh` used to be unreliable on msan: 4 of 5 msan instances produced a symbolized
+report on only 1-2 of 3 attempts, versus 0 of 12 for asan and ubsan.
+
+**Cause -- the host kernel, not the adapter.** MSan reserves fixed shadow ranges at
+process start (`shadow-2: 0x10000000000-0xfffffffffff`, and others). On hosts with
+`vm.mmap_rnd_bits=32` -- the default on Ubuntu's 6.8 kernel; the older default was 28 --
+32 bits of mmap entropy is enough that the loader intermittently lands a mapping inside
+one of those ranges. The target then dies of SIGSEGV *during MSan init*, before libFuzzer
+prints its first line. Measured on 42470668, same container, same session: **11/40 runs
+segfault with ASLR on, 0/40 with it off**.
+
+`vm.mmap_rnd_bits` is not namespaced, so a container reads the host's value and cannot set
+its own -- `docker run --sysctl vm.mmap_rnd_bits=28` is rejected outright. The reference
+FLBench results were most likely collected on a host where this never fired. Do not
+"fix" this by setting the host sysctl: it is global, it silently changes every other
+workload on the machine, and it makes the bug unreproducible so a regression would pass
+unnoticed.
+
+**Layer 1 -- prevention (`sidecar/server.py:_disable_aslr`).** The sidecar calls
+`personality(ADDR_NO_RANDOMIZE)` once at startup. The bit is inherited across fork/exec,
+so every PoC run gets it without a per-call wrapper or a dependency on `setarch` existing
+in the ARVO image.
+
+This requires `security_opt: [seccomp=unconfined]` on the `poc` service, and **that line is
+load-bearing, not incidental hardening**: Docker's default seccomp profile denies
+`personality` with EPERM, so the call is a silent no-op without it. Measured with the host
+at 32, identical `server.py`: 20/20 with the line, 17/20 without it.
+
+`seccomp=unconfined` removes only the syscall filter for that one container. It grants no
+capabilities and leaves `/proc/sys` read-only -- unlike `--privileged`, it cannot touch the
+host. The container it applies to is the one already executing a crashing fuzz target, on
+an isolated network, with no agent access to its filesystem.
+
+**Layer 2 -- recovery (`sidecar/server.py:_is_startup_crash`).** Layer 1 depends on the
+runtime honoring `security_opt`. Kubernetes needs `securityContext.seccompProfile:
+Unconfined` instead, and other backends may not expose it at all -- where it is ignored,
+prevention degrades **silently** back to the old flake. So the sidecar also detects the
+crash and retries, up to `POC_MAX_ATTEMPTS` (5; at the worst rate measured, ~27%, that
+leaves a ~0.14% residual).
+
+The signature is *absence of a sanitizer report* on a signal death -- not empty output.
+`arvo` is a shell script, so its own `Segmentation fault` notice lands in the captured
+output even when the target produced nothing. A genuine crash, including the genuine SEGVs
+several instances have, always emits a report first.
+
+Retrying on this signature cannot corrupt a result: a deterministic outcome reproduces on
+every attempt and is returned unchanged, so the retry only ever re-rolls an outcome that
+was nondeterministic to begin with.
+
+**Verification** (host restored to `vm.mmap_rnd_bits=32`, 30 calls through the real
+sidecar from the agent container):
+
+| configuration | symbolized | retries fired |
+| --- | --- | --- |
+| retry only, ASLR on (simulates a runtime ignoring `security_opt`) | 30/30 | 7 |
+| retry + `personality` (shipped) | 30/30 | 0 |
+
+Plus 17/17 in the sweep with every instance at 3/3, 4/4 config boundaries, and 20/20 under
+a real `harbor run` with `SecurityOpt: [seccomp=unconfined]` confirmed on the
+Harbor-launched container -- Harbor's compose overlay preserves the field.
+
+If you change either layer, re-verify **with the host at 32**. At 28 the bug cannot occur
+and any test passes for the wrong reason.
 
 ## Task design
 
