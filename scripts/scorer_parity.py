@@ -1,6 +1,6 @@
 """Scorer parity gate: replay archived FLBench predictions through the vendored scorer.
 
-The core migration gate (step 3 of doc/migration-parity-plan.md). FLBench's
+The core migration gate. FLBench's
 `eval_runs` table stores every scored prediction together with the six metrics
 `flbench.eval.score` computed for it. Re-scoring those same predictions with the
 adapter's vendored scorer must reproduce all six values exactly.

@@ -1,6 +1,6 @@
 """Environment parity sweep: verify generated tasks hold up across instances.
 
-Step 4 of doc/migration-parity-plan.md. Config boundaries are covered separately by
+Config boundaries are covered separately by
 scripts/config_boundaries.py on one instance; this sweep asks the orthogonal
 question -- does the task shape work across projects, sanitizers, languages, and
 ARVO base images?

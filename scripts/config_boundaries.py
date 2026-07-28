@@ -1,6 +1,6 @@
 """Config boundary gate: assert each config withholds what it claims to.
 
-Step 5 of doc/migration-parity-plan.md. An earlier version of this check grepped
+An earlier version of this check grepped
 the generated files, which could only ever confirm what staging *writes* -- the
 leak was everything staging never touched, so the check could not fail. This one
 brings the environment up and interrogates the agent's container directly.
