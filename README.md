@@ -10,9 +10,9 @@ against ground truth from the cleaned developer patch. No build, no repair.
 
 **Status:** all gates passing — scorer parity (10,508/10,508 archived predictions re-score
 identically on all six metrics), config boundaries (4/4), controls (`oracle` 1.0 / `nop`
-0.0), environment sweep (17/17 instances, every one 3/3 on the PoC path), and live agents
-under Harbor producing valid predictions. Each is reproducible via the `scripts/` entry
-named below. Remaining: runtime profiling to pick a fast-debug subset.
+0.0), environment sweep (17/17 instances), and live agents under Harbor producing valid
+predictions. Each is reproducible via the `scripts/` entry named below. Remaining: runtime
+profiling to pick a fast-debug subset.
 
 ## Quick start
 
@@ -120,58 +120,51 @@ Harbor's mean includes them. To reproduce historical FLBench aggregates, filter
 A scorer crash writes no reward file and errors the trial. An infrastructure failure must
 never surface as a low score — nothing downstream could distinguish it from a bad agent.
 
-## Notes
+## When running
 
-Each of these cost a failed run.
+- **Set `delete: false`** (or `harbor run --no-delete`). Harbor's default teardown runs
+  `docker compose down --rmi local --volumes`, which deletes every image in the stack —
+  including the digest-pinned ARVO base, a ~3 GB re-pull per trial. Only compose tasks
+  reach that branch. A registry does not help; it turns deletion into a re-pull.
+- **`unset OPENAI_BASE_URL` before any codex subscription run.** It is read from the
+  ambient environment independently of `CODEX_AUTH_JSON_PATH`, so a stray `export` — or a
+  sourced `.env` — sends a ChatGPT-authenticated run to the wrong backend without warning.
+- **Model names are not portable across auth modes.** `gpt-5.3-codex` is rejected for
+  ChatGPT accounts; `~/.codex/models_cache.json` lists what an account may use.
+- **Declare environment variables in `environment/docker-compose.yaml`.**
+  `[environment.env]` is silently ignored for compose environments.
+- **Agents are limited to what `agent-image/` bakes in** (`claude-code`, `codex`).
+  `[environment] no-network` applies during `agent.setup()`, so Harbor cannot install one
+  at run time; both skip installation when a satisfying binary is present.
 
-- **msan PoC flake — fixed in two layers; keep both.** MSan reserves fixed shadow ranges at
-  startup. On hosts with `vm.mmap_rnd_bits=32` (Ubuntu 6.8 default; formerly 28) the loader
-  intermittently lands a mapping inside one and the target dies of SIGSEGV *during MSan
-  init*, before libFuzzer's first line — measured 11/40 runs on 42470668, 0/40 with ASLR
-  off. The sysctl is not namespaced, so a container cannot set its own; **do not** set it
-  host-wide, which changes every other workload and makes the bug unreproducible.
-  *Layer 1:* `sidecar/server.py:_disable_aslr` calls `personality(ADDR_NO_RANDOMIZE)` once
-  at startup (inherited by every child). This needs `security_opt: [seccomp=unconfined]` on
-  `poc` — **load-bearing, not hardening**: Docker's default profile denies `personality`
-  with EPERM, making the call a silent no-op (20/20 with the line, 17/20 without).
-  *Layer 2:* `_is_startup_crash` retries the run, because Layer 1 depends on the runtime
-  honoring `security_opt` — Kubernetes needs `securityContext.seccompProfile: Unconfined`
-  and other backends may ignore it, degrading **silently**. The signature is *absence of a
-  sanitizer report* on a signal death, not empty output (`arvo` is a shell script; its own
-  "Segmentation fault" notice lands in the captured output). Retrying cannot corrupt a
-  result: a deterministic outcome reproduces and is returned unchanged. Verified at
-  `mmap_rnd_bits=32`, 30 calls each: retry-only 30/30 with 7 retries fired; retry +
-  personality 30/30 with 0. **Re-verify any change with the host at 32** — at 28 the bug
-  cannot occur and the test passes for the wrong reason.
-- **`OPENAI_BASE_URL` overrides subscription auth.** Read from the ambient environment
-  independently of `CODEX_AUTH_JSON_PATH`, so a stray `export` — or a sourced `.env` —
-  silently sends a ChatGPT-authenticated run to the wrong backend. `unset` it first. Model
-  names are not portable across auth modes either: `gpt-5.3-codex` is rejected for ChatGPT
-  accounts; see `~/.codex/models_cache.json` for what an account may use.
-- **`up --wait` returns when the container is *running*, not when its command finishes.**
-  Without a gate the agent starts against a half-populated `/workspace/src` and silently
-  scores like a bad agent. Staging writes `/workspace/.staged` last and `main` healthchecks
-  on it. Small projects hide this; it surfaced only on the multi-project sweep.
-- **Harbor's default teardown deletes every image in a compose stack.** `delete: true` runs
-  `docker compose down --rmi local --volumes`, which removed both `faultloc-agent:v1` and
-  the digest-pinned ARVO base — a ~3 GB re-pull per trial. Only compose tasks reach that
-  branch. Use `delete: false` or `--no-delete`. A registry does not fix this; it converts
-  deletion into a re-pull.
-- **Plain `down` keeps named volumes**, so the shared source volume is tmpfs-backed
-  (`driver_opts: {type: tmpfs, ...}`). Disk-backed leaked ~120 MB per trial, unbounded
-  (measured 2.3 GB over 21 trials). `size` is a ceiling, not an allocation.
-- **Harbor's egress control collapses compose services into one network namespace.** A
-  service declaring neither `networks` nor `network_mode` moves into the egress sidecar's
-  netns and loses its DNS name, so `main` could not resolve `poc` (curl exit 6). `poc`
-  therefore declares `networks: [default]`. Relatedly `[environment]` must stay `public` —
-  staging fetches the PoC before any agent exists, and `no-network` blocks it (curl exit
-  52). The policy that matters is `[agent]`, applied during `agent.run()`.
-- **`[environment.env]` is silently ignored for compose environments.** Declare variables,
-  `PATH` included, in `environment/docker-compose.yaml`.
-- **Agent choice is constrained to what the agent image bakes in** (`claude_code`,
-  `codex`), since `[environment] no-network` applies during `agent.setup()`. Both skip
-  installation when a satisfying binary is present.
-- **`docker compose up` only builds when the image is missing** — editing an embedded
-  sidecar and re-running silently reuses the cached image unless `--build` is passed.
+## Do not change
+
+Each of these is load-bearing. Removing one reintroduces a failure that is silent — the
+run completes and the numbers look plausible.
+
+- **`security_opt: [seccomp=unconfined]` on `poc`.** Docker's default profile denies
+  `personality` with EPERM, which turns `sidecar/server.py:_disable_aslr` into a no-op and
+  makes msan instances intermittently produce no sanitizer report.
+- **`sidecar/server.py:_is_startup_crash` and its retry.** It is the fallback for runtimes
+  that ignore `security_opt`; Kubernetes needs `securityContext.seccompProfile: Unconfined`
+  instead, and other backends may offer nothing equivalent.
+- **`networks: [default]` on `poc`, and `[environment] network_mode = "public"`.** Harbor's
+  egress control moves any service declaring neither `networks` nor `network_mode` into the
+  egress sidecar's netns, where it loses its DNS name. Staging also fetches the PoC before
+  any agent exists, which a `no-network` baseline blocks. The policy that constrains the
+  agent is `[agent]`, applied during `agent.run()`.
+- **The `src` volume's tmpfs `driver_opts`.** Plain `down` keeps named volumes; disk-backed
+  it leaks a source tree per trial (~120 MB, unbounded). `size` is a ceiling, not an
+  allocation.
+- **`/workspace/.staged` written last, plus `main`'s healthcheck on it.** `up --wait`
+  returns when the container is *running*, not when staging finishes; without the gate the
+  agent starts against a half-populated `/workspace/src`.
+- **`src/faultloc_adapter/scorer/`, a verbatim copy of `flbench.eval`.** Parity is
+  meaningless if the metric is reimplemented. Re-vendor from FLBench instead of editing.
+
+**Never set `vm.mmap_rnd_bits` host-wide.** It is not namespaced, so it changes every other
+workload on the machine, and at 28 the msan failure cannot occur — any test of the two
+mitigations above would pass for the wrong reason. Verify changes to them with the host at
+its default of 32.
 
 Generated datasets, Harbor jobs, and trial artifacts are excluded from version control.
