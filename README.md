@@ -25,14 +25,17 @@ Gates in [`doc/migration-parity-plan.md`](doc/migration-parity-plan.md):
 - **Environment sweep — passing.** 17/17 instances across 17 projects, 3 sanitizers and
   both languages (`doc/env-sweep-report.json`).
 
-Known limitation: `run_poc.sh` is unreliable on msan. 4 of 5 msan instances produced a
-symbolized report on only 1-2 of 3 attempts, versus 0 of 12 for asan and ubsan. This
-reproduces in the pristine ARVO image with no adapter involved, and does not affect
-scoring -- the prompt's sanitizer report is pre-captured from `arvo.db`, and the reward
-depends only on the prediction and the ground truth. Only the optional re-run tool
-degrades.
+Fixed: `run_poc.sh` used to be unreliable on msan -- 4 of 5 msan instances produced a
+symbolized report on only 1-2 of 3 attempts, versus 0 of 12 for asan and ubsan. The cause
+was ASLR, not the adapter: MSan reserves fixed shadow ranges at startup, and on hosts with
+`vm.mmap_rnd_bits=32` (Ubuntu's 6.8 kernel default) the loader intermittently lands a
+mapping inside one, killing the target with SIGSEGV before libFuzzer prints its first
+line. Measured on 42470668: 11/40 runs segfault with ASLR on, 0/40 with it off, same
+container. The sidecar now clears the randomization bit at startup and every PoC run
+inherits it; all five msan instances went 3/3 in the sweep and 20/20 under a dedicated
+100-run replay. See `sidecar/server.py:_disable_aslr`.
 
-Remaining: a live-agent run, and runtime profiling to pick the fast-debug subset.
+Remaining: runtime profiling to pick the fast-debug subset.
 
 ## Task design
 
@@ -155,6 +158,39 @@ uv run harbor run -p datasets/faultloc-adapter/faultloc__42470093-main -a nop
 
 `oracle` must score 1.0 and `nop` must score 0.0 with `prediction_missing = 1`. Treat any
 other outcome as a defect in the task, not in the agent.
+
+### Running a real agent
+
+The agent phase is allowlisted, so the model endpoint must be reachable by name.
+`DEFAULT_ALLOWED_HOSTS` covers the providers Harbor's own agents dial; a self-hosted or
+proxied endpoint needs its host added **at generation time**, since the allowlist is
+baked into `task.toml`:
+
+```bash
+uv run faultloc-adapter --task-ids 42470093 --configs main --overwrite \
+  --allowed-hosts poc my-endpoint.example.com
+```
+
+Auth differs per agent, and only one of them reads a file:
+
+| agent | credential | how Harbor picks it up |
+| --- | --- | --- |
+| `codex` | API key | `OPENAI_API_KEY` (+ `OPENAI_BASE_URL` to retarget) |
+| `codex` | ChatGPT subscription | `CODEX_AUTH_JSON_PATH=~/.codex/auth.json`, uploaded into the container |
+| `claude-code` | API key | `ANTHROPIC_API_KEY` |
+| `claude-code` | subscription | `CLAUDE_FORCE_OAUTH=1` + `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` |
+
+`claude-code` has **no** file path: Harbor points `CLAUDE_CONFIG_DIR` at a fresh empty
+directory in the container and never copies `~/.claude/.credentials.json`.
+
+**`OPENAI_BASE_URL` overrides subscription auth.** It is read from the ambient
+environment independently of `CODEX_AUTH_JSON_PATH`, so a stray `export` — or a sourced
+`.env` — silently sends a ChatGPT-authenticated run to the wrong backend. `unset` it
+before any subscription run.
+
+Model names are not interchangeable across auth modes: `gpt-5.3-codex` is rejected for
+ChatGPT accounts (`400: not supported when using Codex with a ChatGPT account`). Query
+what an account may use with `~/.codex/models_cache.json`.
 
 ## Gotchas
 

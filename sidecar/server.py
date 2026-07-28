@@ -13,10 +13,33 @@ sidecar over the network. Verified: 2648 bytes retrieved on instance 42470093.
 Withholding a file from the filesystem is not withholding it when a network path
 serves the same bytes.
 """
-import os, subprocess, json, threading
+import ctypes, os, subprocess, json, threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 POC_SEARCH_PATHS = ["/tmp/poc", "/poc", "/tmp/crash", "/crash"]
+
+ADDR_NO_RANDOMIZE = 0x0040000
+
+def _disable_aslr():
+    """Turn off address-space randomization for this process and its children.
+
+    MSan reserves fixed shadow ranges at startup (shadow-2 at 0x10000000000 etc).
+    On hosts with vm.mmap_rnd_bits=32 -- the default on Ubuntu's 6.8 kernel -- the
+    loader intermittently places a mapping inside one of those ranges, and the
+    target dies of SIGSEGV during MSan init, before libFuzzer prints its first
+    line. Measured on 42470668 (open62541, msan): 11/40 runs segfault with ASLR
+    on, 0/40 with it off. The personality bit is inherited across fork/exec, so
+    setting it once here covers every PoC run.
+
+    Requires `seccomp=unconfined` on this service; under Docker's default profile
+    the syscall returns EPERM. Best-effort: a failure only restores the old flake.
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        if libc.personality(ADDR_NO_RANDOMIZE) == -1:
+            print("warn: personality(ADDR_NO_RANDOMIZE) failed, msan may be flaky")
+    except Exception as e:
+        print("warn: could not disable ASLR: %s" % e)
 
 def _find_poc_file():
     for p in POC_SEARCH_PATHS:
@@ -96,4 +119,5 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_response(404); self.end_headers()
 
+_disable_aslr()
 HTTPServer(("", 8080), Handler).serve_forever()

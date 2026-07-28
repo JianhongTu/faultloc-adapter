@@ -43,9 +43,10 @@ echo "gt_line=$(sed -n "${GT_LINE}p" "/workspace/src/${GT_FILE}" 2>/dev/null)"
 echo "arvo_bin=$(command -v arvo >/dev/null && echo LEAK || echo absent)"
 echo "src_root=$([ -d /src ] && echo LEAK || echo absent)"
 echo "out_dir=$([ -d /out ] && echo LEAK || echo absent)"
-# Some instances (notably msan) crash without emitting a report on a fraction of
-# runs -- reproducible in the pristine ARVO image, so it is an upstream property.
-# Attempt up to 3 times and record how many produced a symbolized report.
+# msan instances used to crash without emitting a report on a fraction of runs
+# (ASLR colliding with the shadow ranges; fixed in sidecar/server.py:_disable_aslr).
+# Keep attempting 3 times and recording the count -- it is the regression signal:
+# anything below 3/3 means the randomization bit is not being cleared.
 ok=0
 for attempt in 1 2 3; do
   run_poc.sh >/tmp/rp.log 2>&1; last=$?

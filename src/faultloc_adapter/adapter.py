@@ -35,10 +35,19 @@ DEFAULT_AGENT_IMAGE = "faultloc-agent:v1"
 # Model API endpoints reachable during agent.run(). The environment baseline is
 # no-network, so nothing else is: the reference relied on command-level denylists
 # its own README calls bypassable, which let an agent fetch the upstream fix.
-# Per-run endpoints belong on `harbor run --allow-agent-host`, not in 3600 files.
 # `poc` is the sidecar's compose hostname: run_poc.sh must still reach it while the
-# agent is policed. The rest are the model APIs the harness needs.
-DEFAULT_ALLOWED_HOSTS = ("poc", "api.anthropic.com", "api.openai.com")
+# agent is policed. The rest are the model endpoints the supported agents dial --
+# api.openai.com for codex on an API key, chatgpt.com and auth.openai.com for codex
+# on a ChatGPT subscription (auth.json), api.anthropic.com for claude-code. A host
+# missing here fails at the network layer mid-run, so the default covers every
+# provider the harness ships with. Self-hosted endpoints need --allowed-hosts.
+DEFAULT_ALLOWED_HOSTS = (
+    "poc",
+    "api.anthropic.com",
+    "api.openai.com",
+    "chatgpt.com",
+    "auth.openai.com",
+)
 
 POC_TIMEOUT_SEC = 120
 
@@ -383,6 +392,13 @@ services:
   # The agent never sees this filesystem; it reaches the PoC only over HTTP.
   poc:
     init: true
+    # The server disables ASLR so MSan's fixed shadow ranges cannot collide with a
+    # randomly placed mapping (see sidecar/server.py:_disable_aslr). Docker's default
+    # seccomp profile denies the personality syscall with EPERM, so the call is a
+    # no-op without this. Scoped to the sidecar; the agent container keeps the
+    # default profile.
+    security_opt:
+      - seccomp=unconfined
     environment:
       EVAL_CONFIG: "{config}"
       TIMEOUT: "{POC_TIMEOUT_SEC}"
