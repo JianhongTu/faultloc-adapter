@@ -143,7 +143,9 @@ def _read_from_image(manifest: dict, rel_paths: list[str]) -> dict[str, str]:
         r = subprocess.run(
             ["docker", "run", "--rm", "--entrypoint", "sh", image,
              "-c", f"cat /src/{project}/{rel}"],
-            capture_output=True, text=True, timeout=300,
+            # errors="replace": C/C++ sources carry Latin-1 bytes in comments and
+            # string literals often enough that strict UTF-8 fails the instance.
+            capture_output=True, text=True, errors="replace", timeout=300,
         )
         if r.returncode == 0 and r.stdout.strip():
             out[rel] = r.stdout
