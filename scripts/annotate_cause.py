@@ -43,8 +43,10 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -268,7 +270,19 @@ def main() -> int:
                     help="diff and sanitizer report only; skip reading files from the image")
     ap.add_argument("--overwrite", action="store_true",
                     help="re-annotate instances that already have a file in --out")
+    ap.add_argument("--resume", action="store_true",
+                    help="annotate only instances with no file in --out yet. A failed "
+                         "instance writes nothing, so this picks up exactly the ones "
+                         "that did not finish -- rerun until it reports 0 remaining.")
+    ap.add_argument("--workers", type=int, default=2,
+                    help="instances annotated concurrently (default: 2). Both slow "
+                         "legs are I/O waits, so this is close to a linear speedup; "
+                         "raise it only as far as the endpoint tolerates.")
     args = ap.parse_args()
+
+    if args.workers < 1:
+        print("--workers must be >= 1", file=sys.stderr)
+        return 2
 
     base_url = (os.environ.get("OPENAI_BASE_URL") or "").rstrip("/")
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -286,8 +300,39 @@ def main() -> int:
         task_ids = args.task_ids
     else:
         task_ids = locked
+    if args.resume and args.overwrite:
+        print("--resume and --overwrite are mutually exclusive", file=sys.stderr)
+        return 2
     print(f"{len(task_ids)} instance(s) from {args.instance_list.name} "
           f"({len(locked)} locked)")
+
+    prior_flagged: list[str] = []
+    if args.resume:
+        # Filter here rather than leaning on the per-instance skip: at 500
+        # instances that would print several hundred skip lines and report a
+        # remaining count of zero as if it had done the work.
+        pending = [t for t in task_ids if not (args.out / f"{t}.json").exists()]
+        print(f"resume: {len(task_ids) - len(pending)} already annotated, "
+              f"{len(pending)} remaining")
+        # A resume run must account for annotations earlier runs already flagged.
+        # Counting only this run's notes would let the documented "rerun until 0
+        # remaining" loop end in exit 0 while flagged causes sit on disk, ready to
+        # ship into the gold_auto prompt.
+        pending_set = set(pending)
+        prior_flagged = []
+        for t in (t for t in task_ids if t not in pending_set):
+            try:
+                if json.loads((args.out / f"{t}.json").read_text()).get("cause_notes"):
+                    prior_flagged.append(t)
+            except Exception:
+                prior_flagged.append(t)  # unreadable is not "done"
+        if prior_flagged:
+            print(f"resume: {len(prior_flagged)} existing annotation(s) carry review "
+                  f"flags and need attention: {', '.join(prior_flagged[:10])}")
+        task_ids = pending
+        if not task_ids:
+            print("nothing to do")
+            return 1 if prior_flagged else 0
 
     # Annotating needs a frozen manifest for gt_diff, crash_output and the image.
     # Say up front how many are missing rather than emitting one failure per
@@ -299,50 +344,90 @@ def main() -> int:
               f"(e.g. {absent[0]})")
 
     args.out.mkdir(parents=True, exist_ok=True)
-    failed = 0
+    failed = len(prior_flagged)
     errors = []
-    for tid in task_ids:
+
+    # One permit per concurrent annotation, held across both slow legs (the
+    # per-file `docker run` reads and the completion) since they are one unit of
+    # work. Redundant while the pool is capped at the same number -- it cannot
+    # block today -- and kept as the explicit bound so raising the pool size does
+    # not silently unbound the expensive section. Instances never share an image,
+    # so the docker reads do not contend for a pull.
+    slots = threading.Semaphore(args.workers)
+    out_lock = threading.Lock()
+
+    def emit(*lines: str) -> None:
+        """Keep one instance's block together; threads interleave otherwise."""
+        with out_lock:
+            for line in lines:
+                print(line)
+
+    def annotate(tid: str):
+        """Returns (flagged, error) -- error is None on success or skip."""
         dest = args.out / f"{tid}.json"
         if dest.exists() and not args.overwrite:
-            print(f"=== {tid}  skip (exists; --overwrite to redo)")
-            continue
-        try:
-            manifest = json.loads((args.manifest_dir / f"{tid}.json").read_text())
-            rels = _touched_files(manifest["gt_diff"])
-            files = {} if args.no_source else _read_from_image(manifest, rels)
-            prompt = _build_prompt(manifest, files)
-            cause, usage, reasoning_chars = _complete(prompt, args.model, base_url, api_key)
-            notes = _review(cause, manifest)
+            emit(f"=== {tid}  skip (exists; --overwrite to redo)")
+            return False, None
+        with slots:
+            try:
+                manifest = json.loads((args.manifest_dir / f"{tid}.json").read_text())
+                rels = _touched_files(manifest["gt_diff"])
+                files = {} if args.no_source else _read_from_image(manifest, rels)
+                prompt = _build_prompt(manifest, files)
+                cause, usage, reasoning_chars = _complete(
+                    prompt, args.model, base_url, api_key)
+                notes = _review(cause, manifest)
 
-            report = gold_report(manifest)
-            report["cause"] = cause
-            report["cause_model"] = args.model
-            # Provenance records what the model actually saw, not what was asked
-            # for: files can be skipped when the image lays the source out under a
-            # different root, and an arm's behaviour is later attributed to this
-            # field. The `n/m files` stdout line is not persisted; this is.
-            report["cause_source"] = "diff+source" if files else "diff"
-            report["cause_files"] = sorted(files)
-            report["cause_usage"] = {**usage, "reasoning_chars": reasoning_chars}
-            # Review notes travel with the annotation. The exit code is lost as
-            # soon as the batch ends, and a rerun skips files that already exist,
-            # so a flagged cause would otherwise ship into the agent prompt with
-            # nothing on disk recording that it was flagged.
-            report["cause_notes"] = notes
-            dest.write_text(json.dumps(report, indent=2) + "\n")
+                report = gold_report(manifest)
+                # gold_report() ids every report `gold-<id>`, so without this the
+                # hand-authored and model-written arms are indistinguishable in a
+                # file that outlives the run that made it.
+                report["report_id"] = f"{args.out.name}-{args.model}-{tid}"
+                report["cause"] = cause
+                report["cause_model"] = args.model
+                # Provenance records what the model actually saw, not what was
+                # asked for: files can be skipped when the image lays the source
+                # out under a different root, and an arm's behaviour is later
+                # attributed to this field. The `n/m files` stdout line is not
+                # persisted; this is.
+                report["cause_source"] = "diff+source" if files else "diff"
+                report["cause_files"] = sorted(files)
+                report["cause_usage"] = {**usage, "reasoning_chars": reasoning_chars}
+                # Review notes travel with the annotation. The exit code is lost
+                # as soon as the batch ends, and a rerun skips files that already
+                # exist, so a flagged cause would otherwise ship into the agent
+                # prompt with nothing on disk recording that it was flagged.
+                report["cause_notes"] = notes
+                # Atomic: --resume treats "file exists" as "finished", so a
+                # truncated write from a kill or a full disk would be counted as
+                # done and only surface much later as a JSONDecodeError at task
+                # generation. os.replace is atomic within a filesystem.
+                tmp = dest.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(report, indent=2) + "\n")
+                os.replace(tmp, dest)
 
-            print(f"=== {tid} {manifest['project']}  ({len(files)}/{len(rels)} files, "
-                  f"prompt {len(prompt):,} chars)")
-            print(f"    {cause}")
-            print(f"    reasoning {reasoning_chars:,} chars, "
-                  f"completion {usage.get('completion_tokens','?')} tok")
-            print(f"    -> {dest}   {'OK' if not notes else 'CHECK: ' + '; '.join(notes)}")
-            failed += bool(notes)
-        except Exception as e:
-            # One bad instance must not cost the batch. Rerun the script to fill
-            # gaps: completed instances are skipped unless --overwrite.
-            errors.append((tid, f"{type(e).__name__}: {e}"))
-            print(f"=== {tid}  FAILED {type(e).__name__}: {e}")
+                emit(
+                    f"=== {tid} {manifest['project']}  ({len(files)}/{len(rels)} files, "
+                    f"prompt {len(prompt):,} chars)",
+                    f"    {cause}",
+                    f"    reasoning {reasoning_chars:,} chars, "
+                    f"completion {usage.get('completion_tokens','?')} tok",
+                    f"    -> {dest}   "
+                    f"{'OK' if not notes else 'CHECK: ' + '; '.join(notes)}",
+                )
+                return bool(notes), None
+            except Exception as e:
+                # One bad instance must not cost the batch. Rerun the script to
+                # fill gaps: completed instances are skipped unless --overwrite.
+                emit(f"=== {tid}  FAILED {type(e).__name__}: {e}")
+                return False, (tid, f"{type(e).__name__}: {e}")
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        for flagged, err in pool.map(annotate, task_ids):
+            failed += flagged
+            if err:
+                errors.append(err)
+
     if errors:
         print(f"\n{len(errors)} failed: {', '.join(t for t, _ in errors)}")
     return 1 if (failed or errors) else 0
