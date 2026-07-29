@@ -127,10 +127,18 @@ def _read_from_image(manifest: dict, rel_paths: list[str]) -> dict[str, str]:
     agent edits, so this is the only source whose line numbers agree with the
     report the annotation ships with. A file that is not where we expect is
     skipped rather than guessed at, and the caller notes the gap in the prompt.
+
+    Reading NOTHING is a different matter and raises. Source-grounded annotations
+    measured 5/5 correct against ground truth where diff-only measured 4/5, so
+    silently falling back to diff-only is a downgrade to the worse mode -- and it
+    is invisible in the output, which still prints OK. This is not hypothetical:
+    an unauthenticated Docker Hub pull limit produced exactly that on a whole
+    batch. Failing here makes the instance retryable under --resume instead.
     """
     image = pinned_image(manifest)
     project = manifest["project"]
     out: dict[str, str] = {}
+    why: list[str] = []
     for rel in rel_paths:
         r = subprocess.run(
             ["docker", "run", "--rm", "--entrypoint", "sh", image,
@@ -139,6 +147,14 @@ def _read_from_image(manifest: dict, rel_paths: list[str]) -> dict[str, str]:
         )
         if r.returncode == 0 and r.stdout.strip():
             out[rel] = r.stdout
+        else:
+            err = (r.stderr or "").strip().splitlines()
+            why.append(err[-1] if err else f"exit {r.returncode}, no output")
+    if rel_paths and not out:
+        raise RuntimeError(
+            f"read 0 of {len(rel_paths)} source files from {image}: "
+            f"{why[0] if why else 'unknown'}"
+        )
     return out
 
 
