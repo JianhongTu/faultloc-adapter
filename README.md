@@ -37,8 +37,13 @@ uv sync
 # 1. Build the agent image (once; the only image this repo builds)
 docker build -t faultloc-agent:v1 agent-image/
 
-# 2. Freeze an instance -> manifests/<id>.json (committed; no DB or network needed later)
+# 2. Unpack the frozen instance data (500 manifests; no DB or FLBench needed after this)
+tar -xzf data/manifests.tar.gz
+
+# 2b. Or re-freeze from a FLBench checkout, then repack (manifests/ itself is gitignored)
 uv run python -m faultloc_adapter.freeze --flbench ~/codes/FLBench --task-ids 42470093
+tar -czf data/manifests.tar.gz --sort=name --mtime='UTC 2020-01-01' \
+    --owner=0 --group=0 --numeric-owner manifests/
 
 # 3. Generate tasks (omit --configs for all four)
 uv run faultloc-adapter --task-ids 42470093 --configs main

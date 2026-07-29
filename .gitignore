@@ -16,3 +16,8 @@ wheels/
 datasets/
 jobs/
 trials/
+
+# Frozen instance data, rebuilt from a FLBench checkout by
+# `python -m faultloc_adapter.freeze`. Data, not code.
+manifests/
+reports/
