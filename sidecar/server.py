@@ -1,22 +1,66 @@
-"""PoC sidecar: serves the reproducer and its input to the agent container.
+"""PoC sidecar: serves the reproducer, its input, and -- for repair -- the build.
 
-Vendored from FLBench's eval job (k8s/eval-job.yaml, sidecar service) so the PoC
-execution path is the one the reference used. Do not rewrite it; re-vendor from
-FLBench and re-apply the divergence below.
+One sidecar for both task families. The agent container holds no ARVO content of
+its own and reaches everything here over HTTP, which is what makes withholding a
+resource structural rather than prompt-only.
 
-Endpoints: GET /health, GET /poc-file, POST /poc, POST /shutdown.
+Endpoints:
 
-INTENTIONAL DIVERGENCE from the reference: /poc-file is gated on EVAL_CONFIG.
-Upstream gates only /poc (ablation1), leaving /poc-file open -- so an ablation2
-agent, which is supposed to have no PoC input, can fetch the exact bytes from the
-sidecar over the network. Verified: 2648 bytes retrieved on instance 42470093.
-Withholding a file from the filesystem is not withholding it when a network path
-serves the same bytes.
+    GET  /health
+    GET  /poc-file    403 under ablation2
+    POST /poc         403 under ablation1
+    POST /compile     404 unless PROJECT is set (repair only)
+                      403 without the verifier's X-Compile-Token
+
+The PoC execution path is vendored from FLBench's eval job (k8s/eval-job.yaml,
+sidecar service) so localization measures what the reference measured. Re-vendor
+from FLBench and re-apply the divergences below if it ever changes upstream.
+
+DIVERGENCE 1 -- /poc-file is gated on EVAL_CONFIG. Upstream gates only /poc
+(ablation1), leaving /poc-file open, so an ablation2 agent -- which is supposed to
+have no PoC input -- can fetch the exact bytes over the network. Verified: 2648
+bytes retrieved on instance 42470093. Withholding a file from the filesystem is
+not withholding it when a network path serves the same bytes.
+
+DIVERGENCE 2 -- /compile, and one server rather than two. The repair task needs a
+build endpoint the localization task must not have, and it used to live in a
+second file that copied this one's PoC path. The copy is what let the two
+workspaces drift apart: repair silently lost /poc-file, so its agent could run the
+reproducer but not read it, while the diagnosis agent could do both. Gating one
+implementation is checkable; keeping two in step was not.
+
+WHY /compile SYNCS RATHER THAN SHARES A MOUNT. Mounting the volume straight onto
+/src/<project> also works -- Docker prepopulates the empty volume from the image,
+verified on 42508282 -- but `arvo compile` builds in-tree (miniz: 2.1MB of source
+becomes 46MB), and that volume is tmpfs, so every build would sit in RAM and every
+`git diff` in the agent's tree would be buried in object files. Syncing instead
+keeps build output in the container's own filesystem and the agent's tree pristine.
+The invariant the shared mount was there to provide is preserved: what gets
+compiled is whatever is in the agent's tree at the moment of the call, and the
+verifier compiles through this same endpoint, so it cannot diverge from what the
+agent built.
 """
-import ctypes, os, subprocess, json, threading
+import ctypes, os, subprocess, json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 POC_SEARCH_PATHS = ["/tmp/poc", "/poc", "/tmp/crash", "/crash"]
+
+# Where the agent's tree is mounted here, and the ARVO tree `arvo compile` builds.
+SHARED = "/shared"
+PROJECT = os.environ.get("PROJECT", "")
+BUILD_TREE = "/src/" + PROJECT
+
+# Repair sets PROJECT; localization does not. It is the one switch: it enables
+# /compile and nothing else, so a localization task cannot build even by reaching
+# the endpoint directly.
+REPAIR = bool(PROJECT)
+
+# Shared with the verifier through tests/compile_token, which Harbor uploads only
+# at verify time -- so the agent, which can reach this port and is meant to, has
+# no way to present it while it is running. Empty means no one may compile: a task
+# generated without the token fails closed rather than opening the build to the
+# agent. See repair.py, COMPILE_TOKEN_HEADER.
+COMPILE_TOKEN = os.environ.get("COMPILE_TOKEN", "")
 
 ADDR_NO_RANDOMIZE = 0x0040000
 
@@ -41,7 +85,9 @@ def _is_startup_crash(returncode, output):
 
     Retrying on this signature cannot corrupt a result: a deterministic outcome
     reproduces on every attempt and is returned unchanged, so the retry only ever
-    re-rolls an outcome that was nondeterministic to begin with.
+    re-rolls an outcome that was nondeterministic to begin with. It matters most
+    for repair, which is scored on whether the PoC still crashes: one unretried
+    startup crash reads as "the fix did not work" and costs the agent a success.
     """
     # 139 when `timeout` reports the signal as 128+11; -11 if reaped directly.
     if returncode not in (-11, 139):
@@ -80,8 +126,62 @@ def _find_poc_file():
                 return os.path.join(root, f)
     return None
 
+def _run(cmd, timeout, cwd=None):
+    """Run a shell command, returning (exit_code, combined output)."""
+    try:
+        r = subprocess.run(
+            ["timeout", str(timeout), "sh", "-c", cmd], cwd=cwd,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout + 30,
+        )
+        return r.returncode, r.stdout.decode(errors="replace")
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout or b""
+        return -1, (out.decode(errors="replace") if isinstance(out, bytes) else str(out))
+    except Exception as e:
+        return -1, str(e)
+
+def _sync_tree():
+    """Replace the build tree with the agent's tree, from scratch.
+
+    The wipe makes the invariant exact rather than approximate: the tree that gets
+    built is byte-for-byte the tree the agent has, with nothing left over from the
+    image or an earlier call.
+
+    It is also the only thing that makes a second compile possible at all. OSS-Fuzz
+    build scripts are written to run once in a fresh image and are not all
+    idempotent -- miniz's does a bare `mkdir build` and fails with "File exists" on
+    the second call. One compile per trial is the current design, so nothing
+    depends on that today, but any retry or return to an iterating agent would hit
+    it immediately. Full rebuilds cost 3-161s across the frozen instances, which is
+    not worth trading correctness for.
+    """
+    return _run(
+        "rm -rf %s && mkdir -p %s && tar -C %s -cf - . | tar -C %s -xf -"
+        % (BUILD_TREE, BUILD_TREE, SHARED, BUILD_TREE),
+        timeout=300,
+    )
+
+def _run_poc(timeout):
+    """Run the reproducer, retrying only the sanitizer-init crash signature."""
+    for attempt in range(POC_MAX_ATTEMPTS):
+        rc, out = _run("arvo", timeout)
+        if not _is_startup_crash(rc, out):
+            return rc, out
+        # flush: the sidecar's stdout is a pipe, so buffered output would not
+        # reach `docker compose logs` until the process exits.
+        print("retry %d: target died during sanitizer init" % (attempt + 1), flush=True)
+    return rc, out
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
+
+    def _json(self, payload, status=200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
         if self.path == "/health":
@@ -103,56 +203,37 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers()
 
     def do_POST(self):
-        if self.path == "/shutdown":
-            resp = b'{"exit_code": 0, "output": ""}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(resp)))
-            self.end_headers()
-            self.wfile.write(resp)
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
-            return
         if self.path == "/poc":
             # Block execution for PoC-only config: agent may inspect
             # the binary but must not use our tool to run it.
-            config = os.environ.get("EVAL_CONFIG", "main")
-            if config == "ablation1":
-                self.send_response(403)
-                self.end_headers()
+            if os.environ.get("EVAL_CONFIG", "main") == "ablation1":
+                self.send_response(403); self.end_headers(); return
+            rc, out = _run_poc(int(os.environ.get("TIMEOUT", "120")))
+            self._json({"exit_code": rc, "output": out})
+        elif self.path == "/compile" and REPAIR:
+            if not COMPILE_TOKEN or self.headers.get("X-Compile-Token") != COMPILE_TOKEN:
+                self.send_response(403); self.end_headers(); return
+            rc, out = _sync_tree()
+            if rc != 0:
+                # A sync failure is infrastructure, not a failed build: report it
+                # distinctly so the verifier can error the trial instead of
+                # recording a compile failure the agent did not cause.
+                self._json({"exit_code": rc, "output": out, "sync_failed": True})
                 return
-            try:
-                timeout = int(os.environ.get("TIMEOUT", "120"))
-                for attempt in range(POC_MAX_ATTEMPTS):
-                    r = subprocess.run(
-                        ["timeout", str(timeout), "arvo"],
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        timeout=timeout + 30,
-                    )
-                    r.stdout = r.stdout.decode(errors="replace")
-                    if not _is_startup_crash(r.returncode, r.stdout):
-                        break
-                    # flush: the sidecar's stdout is a pipe, so buffered output would
-                    # not reach `docker compose logs` until the process exits.
-                    print("retry %d: target died during sanitizer init"
-                          % (attempt + 1), flush=True)
-            except subprocess.TimeoutExpired as e:
-                r = type("r", (), {
-                    "returncode": -1,
-                    "stdout": (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or ""),
-                })()
-            except Exception as e:
-                r = type("r", (), {"returncode": -1, "stdout": str(e)})()
-            resp = json.dumps({
-                "exit_code": r.returncode,
-                "output": r.stdout,
-            }).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(resp)))
-            self.end_headers()
-            self.wfile.write(resp)
+            # From the project directory, matching the ARVO image's WORKDIR: some
+            # build scripts are relative to it.
+            rc, out = _run(
+                "arvo compile", int(os.environ.get("COMPILE_TIMEOUT", "1800")), cwd=BUILD_TREE
+            )
+            self._json({"exit_code": rc, "output": out, "sync_failed": False})
         else:
             self.send_response(404); self.end_headers()
 
+if REPAIR:
+    # The ARVO images set WORKDIR to the project directory and _sync_tree deletes
+    # it, so a child inheriting that cwd would start in a directory that no longer
+    # exists and die on getcwd. Localization never syncs and keeps the image's
+    # WORKDIR, which is the cwd the reference ran the reproducer from.
+    os.chdir("/")
 _disable_aslr()
 HTTPServer(("", 8080), Handler).serve_forever()

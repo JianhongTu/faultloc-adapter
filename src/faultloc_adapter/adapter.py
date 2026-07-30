@@ -4,7 +4,7 @@ One task per (instance, config), as two compose services:
 
   * `main` runs the agent in `faultloc-agent:v1` and holds no ARVO content of
     its own -- no source, no PoC, no reproducer;
-  * `poc` runs the digest-pinned `n132/arvo:<id>-vul`, stages the source onto a
+  * `poc` runs the archival `n132/arvo:<id>-vul`, stages the source onto a
     shared tmpfs volume, and serves the reproducer over four fixed HTTP
     endpoints.
 
@@ -23,7 +23,7 @@ import shutil
 from pathlib import Path
 
 from . import manifest as manifest_mod
-from .scorer import parse_diff
+from .anchoring import parse_diff_flbench
 
 _TEMPLATE_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -38,21 +38,83 @@ DEFAULT_AGENT_IMAGE = "faultloc-agent:v1"
 # `poc` is the sidecar's compose hostname: run_poc.sh must still reach it while the
 # agent is policed. The rest are the model endpoints the supported agents dial --
 # api.openai.com for codex on an API key, chatgpt.com and auth.openai.com for codex
-# on a ChatGPT subscription (auth.json), api.anthropic.com for claude-code. A host
+# on a ChatGPT subscription (auth.json), api.anthropic.com for claude-code,
+# ellm.nrp-nautilus.io for qwen-coder, which dials OPENAI_BASE_URL. A host
 # missing here fails at the network layer mid-run, so the default covers every
-# provider the harness ships with. Self-hosted endpoints need --allowed-hosts.
+# provider the harness ships with. Other self-hosted endpoints need --allowed-hosts.
 DEFAULT_ALLOWED_HOSTS = (
     "poc",
     "api.anthropic.com",
     "api.openai.com",
     "chatgpt.com",
     "auth.openai.com",
+    "ellm.nrp-nautilus.io",
 )
 
 POC_TIMEOUT_SEC = 120
 
+# The locked instance set these datasets are built over (data/eval500_instance_list.json).
+INSTANCE_SET = "eval500"
+
+DATASET_ROOT = _REPO_ROOT / "datasets"
+
+# One dataset directory per condition, named for the experiment and for what the
+# agent could see. `-main` is the full-information condition; each `-ablation-*`
+# names the resource it withholds rather than a serial number, so a directory
+# says what it is without opening a task. Generation derives the directory from
+# the config, which is what stops a run filing its tasks under another
+# condition's name -- the failure mode a caller-supplied path invites.
+#
+# Keep in step with CONFIGS: a config with no entry here cannot be generated
+# without an explicit --output-dir.
+DATASET_NAMES = {
+    "main": f"flbench-diagnosis-{INSTANCE_SET}-main",
+    "ablation1": f"flbench-diagnosis-{INSTANCE_SET}-ablation-static-only",
+    "ablation2": f"flbench-diagnosis-{INSTANCE_SET}-ablation-no-poc-file",
+    "sanity": f"flbench-diagnosis-{INSTANCE_SET}-sanity-no-source",
+}
+
 # Written once staging finishes; the main service's healthcheck gates on it.
 STAGED_SENTINEL = "/workspace/.staged"
+
+# Sidecar staging: drop the archival history before the agent can read it.
+#
+# `git clean -fdx` restores the working tree but keeps the object store, so the
+# copied checkout still carries every branch, tag and remote-tracking ref the
+# image was built with. Measured on the locked set: all 13 locally cached images
+# had an `origin/HEAD` ahead of the vulnerable revision, 12436 commits ahead on
+# 42470093, where `git log --all` shows the upstream fix and its diff -- the
+# ground truth both task families are scored against. Reading history is ordinary
+# fault localization, so this leaks to a cooperative agent, not just an
+# adversarial one.
+#
+# `find` rather than `rm -rf /shared/.git` because a submodule keeps its own
+# history in a nested `.git` (a directory, or a file pointing at one); none of the
+# 13 cached images has one, but the other 487 are not inspectable without pulling
+# them, and the wider form costs nothing. It also frees the larger part of the
+# tmpfs volume: .git ran 2x-20x the working tree (aom: 394M .git, 20M tree).
+STRIP_ARCHIVAL_GIT = "find /shared -name .git -prune -exec rm -rf {} +"
+
+# Agent staging: give the tree back a repository with no past.
+#
+# Stripping alone would leave the agent without `git status`/`git diff`, which the
+# reference hands it and agent CLIs probe for. One commit over the staged tree is
+# all that is needed, and for repair it is also the patch baseline (BASELINE_TAG).
+# Cheap: 206ms on harfbuzz, and the fresh object store is 7M against 107M.
+BASELINE_REPO_STEPS = (
+    "cd /workspace/src",
+    "git init -q",
+    # -f because the baseline is a SNAPSHOT, not a repository state. A plain
+    # `git add -A` honours .gitignore, and the archival repo tracked files its own
+    # .gitignore matches -- 5 of the 13 cached images, including .cpp, .cil and
+    # CMakeLists.txt. Under the archival history those files were already in HEAD,
+    # so edits to them showed up; against a fresh index they would be invisible to
+    # `git diff harbor-baseline` and a valid repair could be captured as no patch
+    # at all. Nothing ignorable survives here anyway: clean -fdx ran first.
+    "git add -f -A",
+    "git -c user.email=harbor@local -c user.name=harbor "
+    "commit -q --allow-empty -m 'harbor baseline'",
+)
 
 # Which resources each benchmark config exposes, mirroring the reference
 # entrypoint (src/flbench/eval/image/entrypoint.sh).
@@ -91,6 +153,10 @@ def _staging_command(caps: dict) -> str:
         # is staged by another container, so git would otherwise refuse it.
         "git config --global --add safe.directory '*'",
     ]
+    if caps["source"]:
+        # The sidecar stripped the archival .git (STRIP_ARCHIVAL_GIT); rebuild a
+        # repository over the staged snapshot so `git status` and `git diff` work.
+        steps.extend(BASELINE_REPO_STEPS)
     if caps["poc_file"]:
         steps.append("curl -sf http://poc:8080/poc-file -o /workspace/poc")
     if not caps["run_tool"]:
@@ -198,7 +264,7 @@ def _instruction(manifest: dict, caps: dict) -> str:
 def _oracle_spans(gt_diff: str) -> list[dict]:
     """Exact ground-truth spans, used only by solution/solve.sh."""
     spans = []
-    for hunk in parse_diff(gt_diff):
+    for hunk in parse_diff_flbench(gt_diff):
         for line in sorted(hunk.lines):
             spans.append({"file": hunk.file, "line_start": line, "line_end": line + 1})
     return spans
@@ -207,7 +273,6 @@ def _oracle_spans(gt_diff: str) -> list[dict]:
 class FLBenchAdapter:
     def __init__(
         self,
-        output_dir: Path,
         limit: int | None = None,
         overwrite: bool = False,
         task_ids: list[str] | None = None,
@@ -215,10 +280,7 @@ class FLBenchAdapter:
         configs: list[str] | None = None,
         agent_image: str = DEFAULT_AGENT_IMAGE,
         allowed_hosts: list[str] | None = None,
-        org: str = "flbench",
-        **kwargs,
     ):
-        self.output_dir = Path(output_dir)
         self.limit = limit
         self.overwrite = overwrite
         self.task_ids = task_ids
@@ -226,11 +288,19 @@ class FLBenchAdapter:
         self.configs = configs or list(DEFAULT_CONFIGS)
         self.agent_image = agent_image
         self.allowed_hosts = list(allowed_hosts or DEFAULT_ALLOWED_HOSTS)
-        self.org = org
 
         unknown = set(self.configs) - set(CONFIGS)
         if unknown:
             raise ValueError(f"unknown config(s): {sorted(unknown)}")
+
+    def dataset_dir(self, config: str) -> Path:
+        """Where this config's tasks go.
+
+        Derived, never caller-supplied. Task names carry the instance only, so a
+        caller-chosen directory shared by two configs would collide on the same
+        name and silently keep one condition.
+        """
+        return DATASET_ROOT / DATASET_NAMES[config]
 
     def _manifests(self) -> list[dict]:
         paths = sorted(self.manifest_dir.glob("*.json"))
@@ -241,7 +311,7 @@ class FLBenchAdapter:
             if missing:
                 raise FileNotFoundError(
                     f"no manifest in {self.manifest_dir} for: {sorted(missing)}. "
-                    f"Freeze it first with `python -m faultloc_adapter.freeze`."
+                    f"Extract the shipped set with `tar -xzf data/eval500.tar.gz`."
                 )
         return [manifest_mod.load(p) for p in paths]
 
@@ -249,20 +319,23 @@ class FLBenchAdapter:
         manifests = self._manifests()
         if not manifests:
             raise FileNotFoundError(f"no manifests found in {self.manifest_dir}")
-        written = 0
+        # --limit counts INSTANCES, not tasks. Counting tasks would stop mid-fan-out
+        # and leave one config's dataset a task longer than another's -- datasets
+        # that are supposed to differ only in what the agent sees would differ in
+        # size too. The two readings coincide for a single-config run.
+        if self.limit is not None:
+            manifests = manifests[: self.limit]
         for manifest in manifests:
             for config in self.configs:
-                # --limit counts tasks, matching its documented meaning; one
-                # manifest fans out to one task per requested config.
-                if self.limit is not None and written >= self.limit:
-                    return
-                if self._write_task(manifest, config):
-                    written += 1
+                self._write_task(manifest, config)
 
     def _write_task(self, manifest: dict, config: str) -> bool:
         caps = CONFIGS[config]
-        task_id = f"faultloc__{manifest['local_id']}-{config}"
-        task_dir = self.output_dir / task_id
+        # The task names the instance; the dataset directory names the condition.
+        # Putting the condition in both was redundant, and it is the dataset that
+        # Harbor is pointed at -- one job per condition, never pooled.
+        task_id = f"faultloc__{manifest['local_id']}"
+        task_dir = self.dataset_dir(config) / task_id
         if task_dir.exists():
             if not self.overwrite:
                 print(f"skip {task_id} (exists; use --overwrite)")
@@ -272,7 +345,7 @@ class FLBenchAdapter:
         for sub in ("environment", "solution", "tests/scorer"):
             (task_dir / sub).mkdir(parents=True, exist_ok=True)
 
-        (task_dir / "task.toml").write_text(self._task_toml(manifest, task_id, caps))
+        (task_dir / "task.toml").write_text(self._task_toml(manifest, task_id, caps, config))
         (task_dir / "instruction.md").write_text(_instruction(manifest, caps))
         (task_dir / "environment" / "docker-compose.yaml").write_text(
             self._compose(manifest, caps, config)
@@ -283,13 +356,13 @@ class FLBenchAdapter:
         print(f"wrote {task_dir}")
         return True
 
-    def _task_toml(self, manifest: dict, task_id: str, caps: dict) -> str:
+    def _task_toml(self, manifest: dict, task_id: str, caps: dict, config: str) -> str:
         hosts = ", ".join(f'"{h}"' for h in self.allowed_hosts)
         workdir = "/workspace/src" if caps["source"] else "/tmp"
         return f"""version = "1.0"
 
 [task]
-name = "{self.org}/{task_id}"
+name = "flbench/{task_id}"
 description = "Root-cause localization for {manifest['project']}: {manifest['crash_type']}"
 authors = []
 keywords = ["fault-localization", "security", "oss-fuzz", "arvo"]
@@ -300,6 +373,9 @@ category = "debugging"
 local_id = {manifest['local_id']}
 project = "{manifest['project']}"
 sanitizer = "{manifest['sanitizer']}"
+# The condition is no longer in the task name, so this is where a reward file can
+# be traced back to what the agent was allowed to see.
+config = "{config}"
 
 [agent]
 timeout_sec = 1800.0
@@ -332,7 +408,7 @@ memory_mb = 4096
         # so a bare $ in the staging script silently becomes an empty string.
         staging = _staging_command(caps).replace("$", "$$")
         indented = "\n".join("        " + line for line in staging.splitlines())
-        arvo = manifest_mod.pinned_image(manifest)
+        arvo = manifest["image"]
         project = manifest["project"]
         server = "\n".join(
             "        " + line
@@ -346,7 +422,15 @@ memory_mb = 4096
                 "        " + line
                 for line in (
                     f"cp -a /src/{project}/. /shared/",
-                    "git -C /shared clean -fdx >/dev/null 2>&1 || true",
+                    # No `|| true`: a failed clean leaves image build output in the
+                    # tree, the baseline commits it, and the trial runs on a state
+                    # no other trial shares. Under `set -eu` the staging shell dies
+                    # instead, the sentinel is never written and Harbor errors the
+                    # trial. stderr is left connected so the reason reaches the logs.
+                    "git -C /shared clean -fdx >/dev/null",
+                    # Order matters: clean needs the archival index, so the
+                    # history goes only after it has run.
+                    STRIP_ARCHIVAL_GIT,
                 )
             )
         else:
@@ -461,6 +545,7 @@ cat /logs/artifacts/prediction.json
         (tests / "gt.diff").write_text(manifest["gt_diff"])
         for name in ("__init__.py", "types.py", "ground_truth.py", "metrics.py"):
             shutil.copy(_TEMPLATE_DIR / "scorer" / name, tests / "scorer" / name)
+        shutil.copy(_TEMPLATE_DIR / "anchoring.py", tests / "anchoring.py")
         shutil.copy(_TEMPLATE_DIR / "score.py", tests / "score.py")
         test_sh = tests / "test.sh"
         # Start from a clean slate: the verifier shares the agent's container, so

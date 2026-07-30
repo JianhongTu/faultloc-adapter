@@ -1,17 +1,17 @@
 """Harbor verifier entrypoint for the repair task.
 
 Captures the agent's patch, rebuilds from the agent's own tree, re-runs the PoC,
-and -- when a root-cause report was supplied -- scores whether the patch landed
-where the report said it would.
+and scores whether the patch landed where the report said it would. Every arm
+carries a report, so attribution is always scored.
 
 Two things this deliberately does NOT do:
 
   * collapse the outcomes. `compiled`, `poc_suppressed`, `patch_present` and
     `at_location` are all emitted separately, and `repair_ok` carries the plain
-    build-and-suppress result for BOTH conditions. `verified` additionally
-    requires attribution under an assisted condition, so the two arms score under
-    different predicates -- without `repair_ok` the raw repair uplift would not be
-    recoverable from the logs.
+    build-and-suppress result. `verified` additionally requires attribution --
+    a working fix the report did not cause is not what this measures -- so
+    without `repair_ok` the raw repair uplift would not be recoverable from the
+    logs.
   * turn infrastructure into a score. A sidecar that cannot be reached, or a
     source sync that fails, raises: no reward file is written and Harbor errors
     the trial. Nothing downstream could tell a broken sidecar from a bad agent.
@@ -20,6 +20,21 @@ Attribution is `hunk_recall > 0` on the report-vs-patch scoring, i.e. at least o
 hunk of the agent's patch sits at a reported location. That is threshold-free on
 purpose: the continuous metrics are all stored, so a calibrated cutoff can replace
 this rule later without re-running anything.
+
+It is measured with the agent's insertions re-anchored to the gap they occupy
+(anchoring.py). Without that, the two sides of this comparison are built under
+different conventions -- the agent's insertion anchors to the line before it,
+the developer's deletion has concrete lines -- and a patch that fixes the bug at
+exactly the reported site scores zero attribution. Unlike stage 1 there is
+nothing to disclose to the agent: it writes a patch, not spans, so it cannot
+comply with an anchoring convention even in principle.
+
+It is also measured on whole project-relative paths (scorer/metrics.py,
+`full_path`). FLBench compares bare filenames, which here would credit a patch for
+changing a different file that shares a final component with the reported one --
+attribution is the entire point of this metric, so borrowing that defect is not an
+option. `report_flbench_*` and `at_location_flbench` carry the published convention
+on both axes -- bare filenames, un-widened anchor -- for comparability only.
 """
 
 import argparse
@@ -30,12 +45,19 @@ import urllib.request
 from pathlib import Path
 
 try:  # inside the verifier image the scorer sits next to this file
-    from scorer import Span, evaluate_sample, parse_diff
+    from anchoring import parse_diff_anchored, parse_diff_flbench
+    from scorer import Span, evaluate_sample
 except ImportError:  # running from the adapter package
-    from .scorer import Span, evaluate_sample, parse_diff
+    from .anchoring import parse_diff_anchored, parse_diff_flbench
+    from .scorer import Span, evaluate_sample
 
 SIDECAR = "http://poc:8080"
 METRIC_KEYS = ("iou", "hunk_recall", "file_recall", "line_recall", "line_precision", "line_f1")
+
+# Ships in tests/, which Harbor uploads only at verify time, so this file exists
+# for the verifier and never for the agent. That is what makes /compile
+# verifier-only; see repair.py, COMPILE_TOKEN_HEADER.
+COMPILE_TOKEN_PATH = Path("/tests/compile_token")
 
 
 class InfrastructureError(Exception):
@@ -44,6 +66,11 @@ class InfrastructureError(Exception):
 
 def _post(path: str, timeout: int) -> dict:
     req = urllib.request.Request(f"{SIDECAR}{path}", method="POST", data=b"")
+    if path == "/compile":
+        try:
+            req.add_header("X-Compile-Token", COMPILE_TOKEN_PATH.read_text().strip())
+        except OSError as e:
+            raise InfrastructureError(f"no compile token at {COMPILE_TOKEN_PATH}: {e}") from e
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
@@ -78,7 +105,7 @@ def score(
     source: Path,
     baseline: str,
     condition: str,
-    report_spans_path: Path | None,
+    report_spans_path: Path,
     artifacts: Path,
     compile_timeout: int,
     poc_timeout: int,
@@ -118,26 +145,29 @@ def score(
         rewards["patch_present"] and rewards["compiled"] and rewards["poc_suppressed"]
     )
 
-    if report_spans_path is None:
-        # Self-diagnosis: no report was supplied, so attribution is not
-        # applicable. -1 rather than 0, which would read as "missed the mark".
-        rewards["at_location"] = -1
-        rewards.update({f"report_{k}": -1.0 for k in METRIC_KEYS})
-        rewards["verified"] = rewards["repair_ok"]
+    raw = json.loads(report_spans_path.read_text())
+    spans = [Span(s["file"], s["line_start"], s["line_end"]) for s in raw]
+    hunks = parse_diff_anchored(patch)
+    if hunks:
+        metrics = evaluate_sample(spans, hunks, full_path=True)
+        fl = evaluate_sample(spans, parse_diff_flbench(patch))
+        rewards.update({f"report_{k}": metrics[k] for k in METRIC_KEYS})
+        rewards.update({f"report_flbench_{k}": fl[k] for k in METRIC_KEYS})
+        rewards["at_location"] = int(metrics["hunk_recall"] > 0)
+        rewards["at_location_flbench"] = int(fl["hunk_recall"] > 0)
     else:
-        raw = json.loads(report_spans_path.read_text())
-        spans = [Span(s["file"], s["line_start"], s["line_end"]) for s in raw]
-        hunks = parse_diff(patch)
-        if hunks:
-            metrics = evaluate_sample(spans, hunks)
-            rewards.update({f"report_{k}": metrics[k] for k in METRIC_KEYS})
-            rewards["at_location"] = int(metrics["hunk_recall"] > 0)
-        else:
-            # An empty or unparseable patch touches no line, so it can sit at no
-            # reported location.
-            rewards.update({f"report_{k}": 0.0 for k in METRIC_KEYS})
-            rewards["at_location"] = 0
-        rewards["verified"] = int(rewards["repair_ok"] and rewards["at_location"])
+        # An empty or unparseable patch touches no line, so it can sit at no
+        # reported location.
+        rewards.update({f"report_{k}": 0.0 for k in METRIC_KEYS})
+        rewards.update({f"report_flbench_{k}": 0.0 for k in METRIC_KEYS})
+        rewards["at_location"] = 0
+        rewards["at_location_flbench"] = 0
+    # A fix only counts when it is attributable to the reported root cause, so
+    # at_location is a hard requirement and not a diagnostic. There is
+    # deliberately no branch that scores `verified` without it: the retired
+    # `self` arm was the only condition without a report, and letting a
+    # report-less task through would score a fix nothing caused.
+    rewards["verified"] = int(rewards["repair_ok"] and rewards["at_location"])
 
     # `condition` is not emitted as a reward: Harbor averages these keys, and the
     # condition is already carried by the task name and [metadata].
@@ -149,7 +179,8 @@ def main() -> int:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--condition", required=True)
-    parser.add_argument("--report-spans", type=Path, default=None)
+    parser.add_argument("--report-spans", type=Path, required=True,
+                        help="Spans the fix must be attributable to")
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--compile-timeout", type=int, default=2000)

@@ -1,9 +1,12 @@
 """
-Main entry point for the template adapter. Do not modify any of the existing flags.
-You can add any additional flags you need.
+Main entry point for the localization task family (`faultloc-adapter`).
 
-Constructs the Adapter class defined in adapter.py and calls run() to generate tasks
-in the Harbor format at the configured output directory.
+Constructs the Adapter class defined in adapter.py and calls run() to generate one
+dataset per requested config under datasets/ (see DATASET_NAMES in adapter.py).
+
+The template's `--output-dir` is deliberately absent: task names carry the instance
+only, so pointing two configs at one directory would collide on the same name and
+keep whichever was written last. The destination is derived from the config instead.
 """
 
 import argparse
@@ -16,23 +19,13 @@ from .adapter import (
     FLBenchAdapter,
 )
 
-# Default output dir: <repo>/datasets/<adapter_id>
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[2] / "datasets" / "faultloc-adapter"
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help="Directory to write generated tasks",
-    )
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Generate only the first N tasks",
+        help="Generate only the first N instances (each config gets the same N)",
     )
     parser.add_argument(
         "--overwrite",
@@ -76,7 +69,6 @@ def main() -> None:
     args = parser.parse_args()
 
     adapter = FLBenchAdapter(
-        args.output_dir,
         overwrite=args.overwrite,
         limit=args.limit,
         task_ids=args.task_ids,

@@ -21,6 +21,10 @@ Do not exit until the task has been completed.
 
 The vulnerable source is a git working tree at `/workspace/src`. Edit it in place. You do not need to commit; your final working tree is what gets evaluated.
 
+## Proof of Concept
+
+The fuzzer input that triggers the crash is at `/workspace/poc`. Inspect it with `xxd` or `hexdump`: its structure is evidence about which code path reaches the defect.
+
 ## Sanitizer Report
 
 The following report was produced by running the PoC against the vulnerable binary. `run_poc.sh` re-runs it, but note that it executes the **pre-existing build** — it will keep reporting the same crash no matter what you edit, so it is a source of evidence, not a way to check your fix.
@@ -40,6 +44,7 @@ The following report was produced by running the PoC against the vulnerable bina
 
 ### Dedicated tools
 - `run_poc.sh` — run the reproducer against the pre-existing build and print a fresh sanitizer report. Does not reflect your edits.
+- `/workspace/poc` — the raw reproducer input, readable.
 
 ### Bash utilities
 - `rg` — fast regex search across source files

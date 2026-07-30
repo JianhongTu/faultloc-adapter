@@ -16,7 +16,8 @@ One shot also keeps the annotation reproducible, and keeps it from turning into 
 second agent whose search behaviour would confound the arm it is meant to define.
 
 Locations come from the developer patch (`gold_report`), unchanged. Only `cause`
-is generated, so an arm built from this differs from `gold` in authorship alone.
+is generated, so a dataset built from this differs from the reference in
+authorship alone.
 
 WHY THIS EXISTS. `gold_report()` leaves `cause` empty on purpose: text summarising
 a patch leaks the fix. Hand-writing it instead makes the arm unreproducible and
@@ -30,9 +31,9 @@ than the defect. `_review` flags that, along with annotations too long to be
 comparable with the ~200-320 character reports the other arms carry.
 
     # every instance in the locked 500-instance evaluation set
-    uv run python scripts/annotate_cause.py --out reports/gold_auto
+    uv run python scripts/annotate_cause.py --out reports/gold
     # or a subset of it
-    uv run python scripts/annotate_cause.py --task-ids 42495936 --out reports/gold_auto
+    uv run python scripts/annotate_cause.py --task-ids 42495936 --out reports/gold
 
 Reads OPENAI_API_KEY / OPENAI_BASE_URL from the environment (source .env first).
 """
@@ -51,11 +52,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from faultloc_adapter.manifest import pinned_image  # noqa: E402
 from faultloc_adapter.repair import gold_report  # noqa: E402
 
 DEFAULT_MODEL = "kimi"
-# The locked evaluation set. Annotations are the `gold_auto` arm's cause, so the
+# The locked evaluation set. Annotations are the `gold` source's cause, so the
 # instance set they are generated for has to be the one being evaluated --
 # see scripts/select_eval500.py for how it was chosen.
 DEFAULT_INSTANCE_LIST = (
@@ -135,7 +135,7 @@ def _read_from_image(manifest: dict, rel_paths: list[str]) -> dict[str, str]:
     an unauthenticated Docker Hub pull limit produced exactly that on a whole
     batch. Failing here makes the instance retryable under --resume instead.
     """
-    image = pinned_image(manifest)
+    image = manifest["image"]
     project = manifest["project"]
     out: dict[str, str] = {}
     why: list[str] = []
@@ -279,9 +279,9 @@ def main() -> int:
                     help="Instances to annotate (default: every id in --instance-list)")
     ap.add_argument("--instance-list", type=Path, default=DEFAULT_INSTANCE_LIST,
                     help=f"Locked evaluation set (default: {DEFAULT_INSTANCE_LIST.name}). "
-                         "Ids outside it are refused: an annotation is the gold_auto "
+                         "Ids outside it are refused: an annotation is the gold "
                          "arm's cause, so annotating off-set instances is wasted spend.")
-    ap.add_argument("--out", type=Path, required=True, help="e.g. reports/gold_auto")
+    ap.add_argument("--out", type=Path, required=True, help="e.g. reports/gold")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--manifest-dir", type=Path, default=Path("manifests"))
     ap.add_argument("--no-source", action="store_true",
@@ -335,7 +335,7 @@ def main() -> int:
         # A resume run must account for annotations earlier runs already flagged.
         # Counting only this run's notes would let the documented "rerun until 0
         # remaining" loop end in exit 0 while flagged causes sit on disk, ready to
-        # ship into the gold_auto prompt.
+        # ship into the gold prompt.
         pending_set = set(pending)
         prior_flagged = []
         for t in (t for t in task_ids if t not in pending_set):

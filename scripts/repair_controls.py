@@ -6,16 +6,19 @@ That is not a property of the instance -- it is a property of the whole staged
 path, including `git clean -fdx` at staging and the sidecar's tree sync -- so it
 has to be measured through the generated task, not against the bare ARVO image.
 
-Two controls per instance, both on the `gold` task:
+Two controls per instance:
 
   oracle: apply solution/solve.sh, then verify. Must give reward 1.
   nop:    verify an untouched tree.        Must give reward 0, patch_present 0.
 
-Run this before spending anything on agents, and treat it as instance selection
-rather than a pass/fail gate: an instance whose oracle fails is one the harness
-cannot score, and belongs out of the subset.
+Run against the `gold` dataset: repair datasets differ only by the report, which
+neither control reads, so eligibility measured on gold holds for every member of
+the set. Run this before spending anything on agents, and treat it as instance
+selection rather than a pass/fail gate: an instance whose oracle fails is one the
+harness cannot score, and belongs out of the subset.
 
-    python scripts/repair_controls.py --tasks datasets/faultloc-adapter --report repair.json
+    python scripts/repair_controls.py \\
+        --tasks datasets/flbench-repair-eval500-gold --report repair.json
 """
 
 import argparse
@@ -97,6 +100,18 @@ def run_control(task_dir: Path, local_id: str, agent_image: str, keep: bool) -> 
     except subprocess.TimeoutExpired:
         result["status"] = "TIMEOUT"
         return result
+    except Exception as e:
+        # One instance must not take the batch down. This runs 500 instances
+        # through multi-minute build-and-verify cycles under a thread pool, and an
+        # exception escaping the worker is re-raised by future.result() only after
+        # every other container has finished -- so the script dies at the end
+        # having written no --report and thrown away every result it did collect.
+        # `docker cp` with check=True is the live one: a task directory missing
+        # solve.sh raises CalledProcessError, which the TimeoutExpired clause
+        # above does not catch.
+        result["status"] = "ERROR"
+        result["error"] = f"{type(e).__name__}: {e}"[-300:]
+        return result
     finally:
         if not keep:
             subprocess.run(
@@ -135,7 +150,7 @@ def main() -> int:
     pending = []
     for manifest_path in sorted(args.manifests.glob("*.json")):
         local_id = manifest_path.stem
-        task_dir = args.tasks / f"repair__{local_id}-gold"
+        task_dir = args.tasks / f"repair__{local_id}"
         if not task_dir.exists():
             print(f"{local_id}: no generated repair task, skipping")
             continue

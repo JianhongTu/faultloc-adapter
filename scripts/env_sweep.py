@@ -16,7 +16,8 @@ agent's container, that:
 Harbor supplies `main.image` from `[environment] docker_image` via its own compose
 override, so this script supplies an equivalent override to run compose directly.
 
-    python scripts/env_sweep.py --tasks datasets/faultloc-adapter --report sweep.json
+    python scripts/env_sweep.py \\
+        --tasks datasets/flbench-diagnosis-eval500-main --report sweep.json
 """
 
 import argparse
@@ -29,7 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from faultloc_adapter.scorer import parse_diff  # noqa: E402
+from faultloc_adapter.anchoring import parse_diff_flbench  # noqa: E402
 
 # ARVO records labels like "UNKNOWN WRITE" or "Check failed" that never appear
 # verbatim in a SUMMARY line, so a mismatch is reported rather than failed.
@@ -72,7 +73,9 @@ def parse_probe(text: str) -> dict:
 def gt_expectation(manifest: dict) -> tuple[str, int, str]:
     """Return (file, line, expected source text) for the patch's first GT line."""
     diff = manifest["gt_diff"]
-    hunk = parse_diff(diff)[0]
+    # Un-widened: this reads the anchor line's source text out of the image, and
+    # the anchor is min(hunk.lines) under either rule.
+    hunk = parse_diff_flbench(diff)[0]
     line = min(hunk.lines)
     expected = ""
     if not hunk.addition_only:
@@ -167,6 +170,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tasks", type=Path, required=True)
     parser.add_argument("--manifests", type=Path, default=Path("manifests"))
+    # Only labels the report: --tasks already selects the config, since each
+    # one is its own dataset.
     parser.add_argument("--config", default="main")
     parser.add_argument("--agent-image", default="faultloc-agent:v1")
     parser.add_argument("--report", type=Path, default=None)
@@ -182,7 +187,7 @@ def main() -> int:
     pending = []
     for manifest_path in sorted(args.manifests.glob("*.json")):
         manifest = json.loads(manifest_path.read_text())
-        task_dir = args.tasks / f"faultloc__{manifest['local_id']}-{args.config}"
+        task_dir = args.tasks / f"faultloc__{manifest['local_id']}"
         if not task_dir.exists():
             print(f"{manifest['local_id']}: no generated task, skipping")
             continue
