@@ -1,0 +1,53 @@
+# Harbor's egress-sidecar gost config, with request timeouts raised.
+#
+# VERBATIM COPY of harbor 0.20.0's
+# harbor/environments/docker/harbor-docker-egress-control-sidecar/gost.yaml
+# (sha256 78c18e58efbc7c8e226cb311e2a4cf3863d5a2f3e54b3bf15a0ea4b885345290),
+# with ONLY the four `timeout`/`readTimeout` lines below added. Everything else
+# -- the port, the so_mark, the bypass wiring, the allowlist path -- must stay
+# byte-identical, because this file REPLACES Harbor's at runtime and those
+# values are what actually enforce `allowed_hosts`.
+#
+# WHY. gost closes a relayed connection after ~15s of no data. Measured through
+# the sidecar: a response after 10s arrives, after 20s/30s/60s the connection is
+# killed at exactly 15s; the same requests bypassing the sidecar succeed at 60s.
+# The repair verifier POSTs /compile, which runs `arvo compile` for minutes, so
+# every trial died with `RemoteDisconnected` before it could score. POST /poc is
+# exposed too, for any reproducer slower than 15s -- including localization's
+# run_poc.sh, where it would read as "no crash" rather than erroring.
+#
+# Neither Harbor nor gost documents this default, and Harbor exposes no setting
+# for it: NetworkPolicy carries only network_mode and allowed_hosts. This file is
+# mounted over Harbor's via `environment.extra_docker_compose`, which IS a
+# supported surface -- see harbor-overrides/egress-timeout.compose.yaml.
+#
+# scripts/check_egress_override.py fails when Harbor's shipped copy changes, so
+# an upstream edit to the enforcement rules cannot be silently masked by this
+# stale duplicate. If it fires, re-vendor from the new upstream file and re-apply
+# only the timeout lines.
+services:
+  - name: transparent-egress
+    addr: ":12345"
+    bypass: allowlist
+    metadata:
+      so_mark: 114514
+      timeout: 3600s
+    handler:
+      type: red
+      metadata:
+        sniffing: true
+        sniffing.timeout: 5s
+        sniffing.fallback: true
+        timeout: 3600s
+        readTimeout: 3600s
+    listener:
+      type: red
+      metadata:
+        readTimeout: 3600s
+
+bypasses:
+  - name: allowlist
+    whitelist: true
+    reload: 1s
+    file:
+      path: /opt/egress-sidecar/allowlist.txt

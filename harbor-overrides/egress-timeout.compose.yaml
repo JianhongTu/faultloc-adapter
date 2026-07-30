@@ -1,0 +1,27 @@
+# Mounts harbor-overrides/gost.yaml over the egress sidecar's own config.
+#
+# Harbor appends this file to the compose stack BEFORE its own
+# docker-compose-egress-control.yaml (docker.py, _compose_paths), so its service
+# definition merges on top of ours and only the volume is contributed. Verified
+# with `docker compose config`: cap_add, entrypoint, healthcheck and image all
+# survive, and the bind lands on /opt/egress-sidecar/gost.yaml.
+#
+# The sidecar is exempt from egress capture by name (docker.py,
+# _egress_controlled_service_names), so naming it here does not route it through
+# itself.
+#
+# ABSOLUTE PATH REQUIRED. Compose resolves a relative source against the project
+# directory, which Harbor sets to the task's environment/ dir -- not this repo --
+# so `./gost.yaml` would resolve to the wrong place and silently mount nothing
+# useful. FAULTLOC_ROOT must be the absolute path of this checkout:
+#
+#     export FAULTLOC_ROOT="$PWD"
+#
+# Unset, compose expands it to "" and the source becomes /harbor-overrides/gost.yaml,
+# which does not exist -- Docker then creates a DIRECTORY there and gost fails to
+# parse its config, so the sidecar never becomes healthy and the trial errors.
+# Loud, but only at run time; scripts/check_egress_override.py checks it up front.
+services:
+  harbor-docker-egress-control-sidecar:
+    volumes:
+      - "${FAULTLOC_ROOT}/harbor-overrides/gost.yaml:/opt/egress-sidecar/gost.yaml:ro"

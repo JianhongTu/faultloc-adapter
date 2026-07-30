@@ -21,7 +21,14 @@ docker build -t faultloc-agent:v1 agent-image/
 
 sha256sum -c data/eval500.tar.gz.sha256
 tar -xzf data/eval500.tar.gz
+
+export FAULTLOC_ROOT="$PWD"          # see "Egress timeout override" below
+uv run python scripts/check_egress_override.py
 ```
+
+`FAULTLOC_ROOT` is not optional and every `harbor run` must be invoked from the repo
+root; both are checked by `check_egress_override.py`. Run it once per shell before any
+batch — the failure it prevents costs a whole run, not a trial.
 
 The archive contains exactly 500 manifests and their 500 gold reports — the complete
 frozen input. The manifests pin the archival `n132/arvo:<id>-vul` image tags, so nothing
@@ -178,3 +185,43 @@ The repair verifier reports:
 
 Compare each diagnosis report set with the gold ceiling using `verified`; retain
 `repair_ok` to distinguish unattributed repairs from unsuccessful repairs.
+
+## Egress timeout override
+
+Harbor enforces `network_mode = "allowlist"` by injecting a sidecar that captures the
+agent's network namespace and relays every TCP connection through a `gost` transparent
+proxy. `gost` closes a relayed connection after roughly 15 seconds of no data, and neither
+Harbor nor `gost` documents this: `NetworkPolicy` exposes only `network_mode` and
+`allowed_hosts`, with no timeout setting.
+
+That is fatal here. The repair verifier POSTs `/compile`, which runs `arvo compile` for
+minutes and returns nothing until it finishes, so the proxy hangs up first. The first real
+agent run failed 5/5 with `InfrastructureError: POST /compile: Remote end closed connection
+without response` — the agents had produced valid patches, and nothing scored. `POST /poc`
+is exposed the same way for any reproducer slower than 15s, including localization's
+`run_poc.sh`, where the failure would read as "no crash" instead of erroring.
+
+Measured through the sidecar, a response after 10s arrives and 20s/30s/60s are all killed
+at exactly 15s; the same requests bypassing the sidecar succeed at 60s.
+
+`harbor-overrides/gost.yaml` is Harbor's config with the timeouts raised, mounted over the
+sidecar's copy through `environment.extra_docker_compose` — a supported surface, so this is
+configuration rather than a patched install. Verified after the override: 10s, 20s, 60s and
+120s all return 200, while a non-allowlisted host is still blocked.
+
+Two requirements, both enforced by `scripts/check_egress_override.py`:
+
+- `FAULTLOC_ROOT` must be exported. Compose expands it into the bind source; unset, Docker
+  creates a directory at the mount point and the sidecar never becomes healthy.
+- `harbor run` must be invoked from the repo root. Harbor does not expand `${VAR}` in a
+  config file, so the path to the override is relative to the working directory.
+
+The override **replaces** a security-critical file: the bypass wiring, the allowlist path
+and the redirect port in it are what actually enforce `allowed_hosts`. It is therefore
+byte-identical to upstream apart from the timeout lines, and the gate pins the upstream
+SHA-256 it was vendored from. If Harbor changes its copy the gate fails; re-vendor from the
+new file and re-apply only the timeouts rather than leaving a stale duplicate in force.
+
+This is a workaround, not the end state. Making `/compile` and `/poc` asynchronous — return
+a job id, poll for completion — would keep every request far inside any proxy timeout and
+remove the dependency on an undocumented default entirely.

@@ -67,6 +67,23 @@ environment:
   # file, pass `--no-delete` for the same reason.
   delete: false
 
+  # Raises gost's ~15s relay timeout inside Harbor's egress sidecar. Without it
+  # every repair trial errors: the verifier POSTs /compile, `arvo compile` runs
+  # for minutes, and gost hangs up long before it answers -- measured as
+  # `InfrastructureError: POST /compile: Remote end closed connection without
+  # response` on 5/5 of the first real agent run. Harbor exposes no setting for
+  # this, so the fix is a replacement gost.yaml mounted over the sidecar's; see
+  # harbor-overrides/.
+  #
+  # Path is relative to the working directory, so `harbor run` must be invoked
+  # from the repo root -- Harbor does NOT expand ${VAR} in this file, it passes
+  # the string through as a path. The absolute path needed for the bind mount
+  # lives inside the compose file as ${FAULTLOC_ROOT}, which COMPOSE does expand,
+  # so that variable must be exported (README, step 1).
+  # scripts/check_egress_override.py guards both the variable and upstream drift.
+  extra_docker_compose:
+    - harbor-overrides/egress-timeout.compose.yaml
+
 # --------------------------------------------------------------------- retries
 # Only infrastructure is retried. An agent that burns its budget, exits non-zero,
 # overflows its context or refuses has PRODUCED A RESULT. Retrying those would
