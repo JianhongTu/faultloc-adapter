@@ -28,4 +28,16 @@ def load(path: Path) -> dict:
             f"{path}: manifest_version {manifest.get('manifest_version')} "
             f"!= supported {MANIFEST_VERSION}"
         )
+    # `crash_output` is whatever the target printed, and a fuzzer input echoed back
+    # can carry NUL bytes -- 4 of the 500 do. That text is interpolated into
+    # instruction.md, which Harbor passes to the agent as an ARGV ELEMENT of
+    # `docker compose exec`. execve cannot carry a NUL, so Python raises
+    # `ValueError: embedded null byte` before the fork and the trial errors in the
+    # agent phase, deterministically, on every attempt. Strip at load so the
+    # generator and every checker read the same bytes; the manifest file itself is
+    # frozen and stays as it is.
+    # Conditional so a manifest missing the field still fails loudly at the point
+    # of use, as it did before, rather than rendering an empty report section.
+    if isinstance(manifest.get("crash_output"), str):
+        manifest["crash_output"] = manifest["crash_output"].replace("\x00", "")
     return manifest

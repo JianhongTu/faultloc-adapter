@@ -32,6 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from faultloc_adapter import manifest as manifest_mod  # noqa: E402
 from faultloc_adapter.adapter import DATASET_ROOT  # noqa: E402
 from faultloc_adapter.anchoring import parse_diff_anchored  # noqa: E402
 from faultloc_adapter.repair import GOLD_SOURCE, UNRUN_LEDGER, dataset_name  # noqa: E402
@@ -248,7 +249,9 @@ def main() -> int:
 
     results = []
     for manifest_path in sorted(args.manifests.glob("*.json")):
-        manifest = json.loads(manifest_path.read_text())
+        # Via manifest.load, not json.loads: the strip below has to see exactly
+        # the crash_output the generator rendered, NUL removal included.
+        manifest = manifest_mod.load(manifest_path)
         r = check(args.tasks, manifest_path.stem, manifest["gt_diff"], label,
                   manifest.get("crash_output", ""))
         found = r["status"] != "MISSING"
