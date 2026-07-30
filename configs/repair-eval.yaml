@@ -1,15 +1,17 @@
-# Canonical main-evaluation configuration. One supported setup; anything else is a
-# side experiment and does not produce comparable numbers.
+# Canonical stage-2 (repair) configuration. One supported setup; anything else is a
+# side experiment and does not produce comparable numbers. Named for the task
+# family, not the condition: `main` is one of stage 1's four conditions, so a
+# `main-eval.yaml` here would read as the diagnosis config it is not.
 #
 # ONE JOB PER DATASET -- tasks are named for the instance alone, so two datasets
 # pooled into one job would collide. This file pins everything except which
 # dataset; `-p` supplies that and replaces `datasets:` outright, which is what
 # keeps every other value identical across the set.
 #
-#   uv run harbor run -c configs/main-eval.yaml \
+#   uv run harbor run -c configs/repair-eval.yaml \
 #     -p datasets/flbench-repair-eval500-gold --job-name repair-gold
 #
-#   uv run harbor run -c configs/main-eval.yaml \
+#   uv run harbor run -c configs/repair-eval.yaml \
 #     -p datasets/flbench-repair-eval500-diagnosis-<model-id> \
 #     --job-name repair-diagnosis-<model-id>
 #
@@ -17,7 +19,7 @@
 # the canonical one. Prerequisites and the per-dataset gate: see README, "Locking
 # the task set".
 
-job_name: faultloc-main
+job_name: faultloc-repair
 jobs_dir: jobs
 
 # 500 instances x 3 = 1500 trials per dataset. The agent still gets ONE attempt
@@ -75,8 +77,8 @@ environment_build_timeout_multiplier: 1.0
 
 environment:
   # Harbor's default teardown removes the archival ARVO base, forcing a ~3 GB
-  # re-pull per trial. Load-bearing. The diagnosis runs, which do not read this
-  # file, pass `--no-delete` for the same reason.
+  # re-pull per trial. Load-bearing. `configs/diagnosis-eval.yaml` sets the same
+  # thing for stage 1.
   delete: false
 
   # Raises gost's ~15s relay timeout inside Harbor's egress sidecar. Without it

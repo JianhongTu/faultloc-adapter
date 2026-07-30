@@ -73,19 +73,26 @@ for DATASET in \
   flbench-diagnosis-eval500-sanity-no-source
 do
   uv run harbor run \
+    -c configs/diagnosis-eval.yaml \
     -p "datasets/$DATASET" \
     -a "$DIAGNOSIS_AGENT" \
     -m "$DIAGNOSIS_MODEL" \
-    --no-delete \
     --job-name "$DATASET-$DIAGNOSIS_ID"
 done
 ```
 
-`--no-delete` is not optional. Harbor's default teardown runs `docker compose down
---rmi local --volumes`, which removes the archival ARVO base image, and the next
-trial re-pulls roughly 3 GB. Over 4 datasets x 500 instances that dominates the
-runtime. The repair commands below get the same setting from
-`configs/main-eval.yaml` (`environment.delete: false`).
+`configs/diagnosis-eval.yaml` is not optional. It carries the egress timeout
+override, without which any reproducer slower than gost's cut-off is hung up on
+mid-run: `run_poc.sh` catches only `HTTPError`, so the resulting
+`RemoteDisconnected` escapes as a traceback with exit 1 — which its own contract
+reads as *still crashes*. PoC execution is then unavailable for those instances,
+on the condition that gets frozen into `reports/`. See "Egress timeout override"
+below. It also pins one attempt,
+concurrency, the retry allowlist and `environment.delete: false`; that last one
+keeps Harbor's teardown from removing the archival ARVO base and re-pulling
+roughly 3 GB per trial, which over 4 datasets x 500 instances would dominate the
+runtime. Everything that varies between diagnosis models stays on the command
+line.
 
 Each completed trial writes:
 
@@ -142,7 +149,7 @@ diagnosis dataset differs from gold only in the supplied report.
 
 ### 5. Run the fixed implementation agent
 
-`configs/main-eval.yaml` pins the implementation agent, `qwen3-small`, Qwen Code version,
+`configs/repair-eval.yaml` pins the implementation agent, `qwen3-small`, Qwen Code version,
 timeouts, retries, concurrency, and three independent attempts per instance. Configure its
 OpenAI-compatible endpoint in `.env`:
 
@@ -159,12 +166,12 @@ set -a
 set +a
 
 uv run harbor run \
-  -c configs/main-eval.yaml \
+  -c configs/repair-eval.yaml \
   -p datasets/flbench-repair-eval500-gold \
   --print-config
 
 uv run harbor run \
-  -c configs/main-eval.yaml \
+  -c configs/repair-eval.yaml \
   -p datasets/flbench-repair-eval500-gold \
   --job-name repair-gold
 ```
@@ -173,7 +180,7 @@ Run the same fixed configuration for every diagnosis report set:
 
 ```bash
 uv run harbor run \
-  -c configs/main-eval.yaml \
+  -c configs/repair-eval.yaml \
   -p "datasets/flbench-repair-eval500-$SOURCE" \
   --job-name "repair-$SOURCE"
 ```
@@ -204,7 +211,8 @@ minutes and returns nothing until it finishes, so the proxy hangs up first. The 
 agent run failed 5/5 with `InfrastructureError: POST /compile: Remote end closed connection
 without response` — the agents had produced valid patches, and nothing scored. `POST /poc`
 is exposed the same way for any reproducer slower than 15s, including localization's
-`run_poc.sh`, where the failure would read as "no crash" instead of erroring.
+`run_poc.sh`. There the same `RemoteDisconnected` escapes uncaught — `run_poc.sh` handles
+only `HTTPError` — and exits 1, which its own contract reads as "still crashes".
 
 Measured through the sidecar, a response after 10s arrives and 20s/30s/60s are all killed
 at exactly 15s; the same requests bypassing the sidecar succeed at 60s.

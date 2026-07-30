@@ -1,0 +1,90 @@
+# Canonical stage-1 (localization) configuration. The diagnosis model varies, so
+# this file pins everything EXCEPT the agent, the model and the dataset; `-a`, `-m`
+# and `-p` supply those:
+#
+#   uv run harbor run -c configs/diagnosis-eval.yaml \
+#     -p datasets/flbench-diagnosis-eval500-main \
+#     -a "$DIAGNOSIS_AGENT" -m "$DIAGNOSIS_MODEL" \
+#     --job-name "flbench-diagnosis-eval500-main-$DIAGNOSIS_ID"
+#
+# ONE JOB PER DATASET -- tasks are named for the instance alone, so two conditions
+# pooled into one job would collide. `configs/repair-eval.yaml` is the stage-2
+# counterpart and pins its agent, because there the agent is the fixed thing.
+
+job_name: faultloc-diagnosis
+jobs_dir: jobs
+
+# ONE attempt. There is no rule for which of several predictions gets frozen into
+# reports/diagnosis-<id>/, and inventing one (first? best-scoring?) would either be
+# arbitrary or select on the ground truth. Raising this needs that rule first.
+n_attempts: 1
+
+# Stage 1 never compiles -- the verifier scores prediction.json offline -- so the
+# `arvo compile` contention that caps stage 2 does not apply here. Held at 12
+# anyway: 12 concurrent ARVO containers is the load this box is measured at, and
+# stage 1 has no measurement of its own to justify going higher.
+n_concurrent_trials: 12
+
+# ------------------------------------------------------------ time + resources
+# Budgets live in each task.toml (agent 1800s, verifier 300s, 2 CPU, 4 GB).
+# Multipliers pinned at 1.0. This does NOT stop a CLI flag from rescaling a batch
+# -- flags override this file -- it makes the value explicit in --print-config and
+# in each job's lock.json, and holds it if a Harbor default ever moves.
+timeout_multiplier: 1.0
+agent_timeout_multiplier: 1.0
+verifier_timeout_multiplier: 1.0
+agent_setup_timeout_multiplier: 1.0
+environment_build_timeout_multiplier: 1.0
+
+environment:
+  # Harbor's default teardown removes the archival ARVO base, forcing a ~3 GB
+  # re-pull per trial. Over 4 conditions x 500 instances that dominates runtime.
+  delete: false
+
+  # Raises gost's ~15s relay timeout inside Harbor's egress sidecar. Load-bearing
+  # for stage 1: the agent's run_poc.sh POSTs to the PoC sidecar over HTTP, and
+  # the sidecar is given POC_TIMEOUT_SEC = 120 to answer, so any reproducer past
+  # gost's cut-off is hung up on mid-run. run_poc.sh catches only HTTPError
+  # (agent-image/run_poc.sh:11), and a cut relay raises RemoteDisconnected --
+  # uncaught, so the model gets a traceback, empty stdout and exit 1, which that
+  # script's own contract reads as STILL CRASHES. Loud rather than silent, but
+  # the observation is wrong and PoC execution is simply unavailable for those
+  # instances -- on exactly the main condition that gets frozen into reports/.
+  # See README, "Egress timeout override".
+  #
+  # Path is relative to the working directory, so `harbor run` must be invoked
+  # from the repo root, and the absolute path inside the compose file comes from
+  # ${FAULTLOC_ROOT}, which must be exported.
+  # scripts/check_egress_override.py guards the variable and upstream drift; it
+  # derives its own root from __file__ and so passes from any directory, which
+  # leaves the working-directory requirement unchecked.
+  extra_docker_compose:
+    - harbor-overrides/egress-timeout.compose.yaml
+
+# --------------------------------------------------------------------- retries
+# Only infrastructure is retried. A model that burns its budget, exits non-zero,
+# overflows its context or writes no prediction has PRODUCED A RESULT; retrying
+# those would resample until it succeeded and inflate every localization rate.
+# score.py scores a missing or malformed prediction as zero AND flags it
+# (`prediction_missing` / `prediction_invalid`), so the two are separable at
+# analysis time -- read those flags alongside `reward`, not instead of it.
+retry:
+  max_retries: 3
+  min_wait_sec: 5
+  max_wait_sec: 120
+  include_exceptions:
+    - ApiConnectionError
+    - ApiConnectionClosedError
+    - ApiInternalServerError
+    - ApiOverloadedError
+    - ApiRateLimitError
+    - ApiResponseStalledError
+    - EnvironmentStartTimeoutError
+    - HealthcheckError
+    - NetworkConnectionError
+
+# ------------------------------------------------------------------- task set
+# Default target; override with `-p <dataset>` per condition. Only the main
+# condition feeds stage 2; the three ablations are stage-1 analysis.
+datasets:
+  - path: datasets/flbench-diagnosis-eval500-main

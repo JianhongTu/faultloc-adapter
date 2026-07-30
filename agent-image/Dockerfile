@@ -11,7 +11,7 @@
 #
 # Not exhaustive: `qwen-coder`, the implementation agent the repair experiment
 # actually runs, is NOT baked here -- Harbor installs the Qwen Code CLI fresh in
-# every trial and configs/main-eval.yaml pins it through `kwargs.version`.
+# every trial and configs/repair-eval.yaml pins it through `kwargs.version`.
 #
 # Both task families set [environment] network_mode = "public", because staging
 # has to reach the PoC sidecar before any agent exists; the run itself is policed
