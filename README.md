@@ -20,18 +20,16 @@ uv sync
 docker build -t faultloc-agent:v1 agent-image/
 
 sha256sum -c data/eval500.tar.gz.sha256
-rm -rf manifests reports/gold          # see below: tar does not remove stale files
+rm -rf manifests reports/gold
 tar -xzf data/eval500.tar.gz
 
 export FAULTLOC_ROOT="$PWD"          # see "Egress timeout override" below
 uv run python scripts/check_egress_override.py
 ```
 
-The `rm -rf` matters whenever the instance set has changed. `tar -xzf` unpacks over the
-existing directories without deleting anything the archive no longer contains, so a
-re-extract leaves the retired instances behind — a 500-instance archive over a previous
-500 produced 529 manifests. Dataset generation iterates `manifests/`, so those extra
-instances become extra tasks, and nothing downstream flags it.
+`manifests/` and `reports/gold/` are extraction targets, not sources: the archive is the
+artifact, and those directories are rebuilt from it. Remove them first so what is on disk
+is exactly what the archive holds.
 
 `FAULTLOC_ROOT` is not optional and every `harbor run` must be invoked from the repo
 root; both are checked by `check_egress_override.py`. Run it once per shell before any

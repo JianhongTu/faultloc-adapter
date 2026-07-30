@@ -38,17 +38,27 @@ DEFAULT_AGENT_IMAGE = "faultloc-agent:v1"
 # `poc` is the sidecar's compose hostname: run_poc.sh must still reach it while the
 # agent is policed. The rest are the model endpoints the supported agents dial --
 # api.openai.com for codex on an API key, chatgpt.com and auth.openai.com for codex
-# on a ChatGPT subscription (auth.json), api.anthropic.com for claude-code,
-# ellm.nrp-nautilus.io for qwen-coder, which dials OPENAI_BASE_URL. A host
-# missing here fails at the network layer mid-run, so the default covers every
-# provider the harness ships with. Other self-hosted endpoints need --allowed-hosts.
+# on a ChatGPT subscription (auth.json), api.anthropic.com for claude-code, and the
+# self-hosted vLLM endpoint qwen-coder dials through OPENAI_BASE_URL. A host missing
+# here fails at the network layer mid-run. Other endpoints need --allowed-hosts.
+#
+# The vLLM endpoint is listed BY HOSTNAME AND BY ADDRESS because only the address
+# works today. Harbor's allowlist sidecar captures the agent's network namespace and
+# its nftables ruleset rejects all non-TCP egress, which includes UDP DNS: inside
+# that namespace an external name does not resolve (`getaddrinfo EAI_AGAIN`), and the
+# agent never reaches the model. Container names still resolve -- Docker answers
+# those from its own table without an upstream query -- which is why `poc` is
+# unaffected. Docker 29 does not exhibit this; the evaluation box runs 25.0.14.
+# Keep the hostname so the entry survives a Docker upgrade, and keep the address so
+# the run works before one. Both are ephemeral: an EC2 replacement changes them.
 DEFAULT_ALLOWED_HOSTS = (
     "poc",
     "api.anthropic.com",
     "api.openai.com",
     "chatgpt.com",
     "auth.openai.com",
-    "ellm.nrp-nautilus.io",
+    "ec2-16-56-22-55.compute-1.amazonaws.com",
+    "172.31.96.73",
 )
 
 POC_TIMEOUT_SEC = 120
