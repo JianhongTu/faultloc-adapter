@@ -28,15 +28,18 @@ n_attempts: 3
 # The box is dedicated. Raise only with storage headroom to match: each concurrent
 # trial holds an ARVO image plus a synced build tree.
 #
-# 8, not 16, because of the VERIFIER rather than the agent. Agent phases are
+# The binding constraint is the VERIFIER, not the agent. Agent phases are
 # API-bound and oversubscribe harmlessly, but each verifier runs `arvo compile`,
 # and concurrent builds contend for real cores -- at 16 on the 32-core box, load
 # reached 50-64 and one build (wget2) ran past 25 minutes against a 1800s ceiling.
 # A build that times out under contention is recorded as `compiled: 0`, which is
 # indistinguishable in the reward file from a patch that genuinely does not
-# build. That failure is silent and biased toward slow-building projects, so the
-# throughput is not worth it.
-n_concurrent_trials: 8
+# build: silent, and biased toward slow-building projects.
+#
+# 12 is the operating point -- measured safe at 8, measured harmful at 16, and
+# untested in between. If a batch shows `compiled` dropping on the slow projects
+# relative to a run at 8, contention is the first thing to suspect.
+n_concurrent_trials: 12
 
 # ---------------------------------------------------------------- agent + model
 # `qwen-coder` is Harbor's name for the Qwen Code CLI; `qwen-code` is not a valid
