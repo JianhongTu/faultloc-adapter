@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Freeze data/alternative-patch-eval50.json -- the 50-instance alternative-patch sample.
 
+HISTORICAL. This produced the FIRST draw. It is not what the shipped sample is:
+six instances were swapped out afterwards, by hand, because their projects ship
+no test suite we could reproduce -- see the `replacements` block in the sample
+itself. So `--check` reports MISMATCH by design, and running this WITHOUT
+`--check` overwrites the curated file and reinstates those six. Do not re-run it
+to regenerate the sample; the sample on disk is the artifact.
+
 The alternative-patch study asks whether valid repair locations outside the
 developer patch change the benchmark's model ranking. That is a bounded
 sensitivity analysis on 10% of the locked eval500 set, so the subset has to be

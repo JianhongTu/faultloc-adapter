@@ -235,6 +235,12 @@ TEST_TOOL = "/usr/local/bin/run_tests.sh"
 # Where the frozen suite lives inside the SIDECAR. Never in the agent's tree:
 # the tree is what the suite tests.
 SIDECAR_TEST_SCRIPT = "/usr/local/bin/frozen_test.sh"
+# Optional, per instance: whatever the suite needs installed before it can build.
+# It runs at STAGING time rather than inside the suite because installing a build
+# dependency needs the network, and a network failure inside the suite is
+# indistinguishable from a regression -- the verifier reads one exit code. The
+# staging shell runs under `set -eu`, so a failure here kills the trial instead.
+SIDECAR_SETUP_SCRIPT = "/usr/local/bin/frozen_setup.sh"
 
 
 def _build_tool(local_id: int) -> str:
@@ -368,26 +374,41 @@ def resolve_suite(manifest: dict, testset_dir: Path) -> dict:
     record to keep in sync with the file it describes.
     """
     stub = placeholder(manifest["project"])
-    path = testset_dir / str(manifest["local_id"]) / "test.sh"
+    base = testset_dir / str(manifest["local_id"])
+    path = base / "test.sh"
+    setup = base / "setup.sh"
+    resolved = {"path": path, "setup": setup.read_text() if setup.exists() else ""}
     if path.exists() and path.read_text() != stub:
-        return {"script": path.read_text(), "authored": True, "path": path}
+        return {**resolved, "script": path.read_text(), "authored": True}
     if not path.exists():
         write_suite(testset_dir, manifest["local_id"], stub)
-    return {"script": stub, "authored": False, "path": path}
+    return {**resolved, "script": stub, "authored": False}
 
 
-def _sidecar_setup(script: str) -> str:
+def _sidecar_setup(script: str, setup: str = "") -> str:
     """Stage the test script into the sidecar, base64-encoded.
 
     Same reason build.sh is encoded: this string is embedded in a compose block
     scalar and then `$`-escaped, and the payload is an arbitrary shell script
     full of quotes, `$` and heredocs of its own.
+
+    An instance's setup.sh, where it has one, is staged and RUN here -- see
+    SIDECAR_SETUP_SCRIPT for why it does not belong inside the suite.
     """
+    lines = []
+    if setup:
+        blob = base64.b64encode(setup.encode()).decode()
+        lines += [
+            f"echo {blob} | base64 -d > {SIDECAR_SETUP_SCRIPT}",
+            f"chmod +x {SIDECAR_SETUP_SCRIPT}",
+            SIDECAR_SETUP_SCRIPT,
+        ]
     blob = base64.b64encode(script.encode()).decode()
-    return "\n".join([
+    lines += [
         f"echo {blob} | base64 -d > {SIDECAR_TEST_SCRIPT}",
         f"chmod +x {SIDECAR_TEST_SCRIPT}",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def _staging(manifest: dict, with_tests: bool) -> str:
@@ -607,8 +628,12 @@ class RepairAdapter:
         """
         authored = [s for s in suites if s["authored"]]
         stub = [s for s in suites if not s["authored"]]
+        with_setup = [s for s in authored if s["setup"]]
         print(f"\ntest suites: {len(authored)} authored, "
               f"{len(stub)} PLACEHOLDER, of {written} generated task(s)")
+        if with_setup:
+            print(f"  {len(with_setup)} carry a setup.sh the sidecar runs before the "
+                  "server starts")
         if not stub:
             return
         print(
@@ -663,7 +688,7 @@ class RepairAdapter:
                     "TEST_SCRIPT": SIDECAR_TEST_SCRIPT,
                     "TEST_TIMEOUT": str(TEST_TIMEOUT_SEC),
                 },
-                sidecar_setup=_sidecar_setup(suite["script"]),
+                sidecar_setup=_sidecar_setup(suite["script"], suite["setup"]),
             )
         )
         self._write_solution(task_dir, manifest)
