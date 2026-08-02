@@ -1,4 +1,5 @@
-# Mounts harbor-overrides/gost.yaml over the egress sidecar's own config.
+# Mounts harbor-overrides/gost.yaml and harbor-overrides/network-policy over the
+# egress sidecar's own config and nftables generator.
 #
 # Harbor appends this file to the compose stack BEFORE its own
 # docker-compose-egress-control.yaml (docker.py, _compose_paths), so its service
@@ -25,3 +26,4 @@ services:
   harbor-docker-egress-control-sidecar:
     volumes:
       - "${FAULTLOC_ROOT}/harbor-overrides/gost.yaml:/opt/egress-sidecar/gost.yaml:ro"
+      - "${FAULTLOC_ROOT}/harbor-overrides/network-policy:/usr/local/bin/network-policy:ro"
