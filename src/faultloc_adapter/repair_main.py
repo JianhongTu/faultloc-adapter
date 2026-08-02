@@ -12,7 +12,7 @@ than to the task. See repair.py.
 import argparse
 from pathlib import Path
 
-from .adapter import DEFAULT_AGENT_IMAGE, DEFAULT_ALLOWED_HOSTS
+from .adapter import DEFAULT_AGENT_IMAGE
 from .repair import RepairAdapter
 
 
@@ -50,16 +50,6 @@ def main() -> None:
         ),
     )
     parser.add_argument("--agent-image", default=DEFAULT_AGENT_IMAGE)
-    parser.add_argument(
-        "--allowed-hosts",
-        nargs="+",
-        default=None,
-        help=(
-            "Hosts the agent may reach during agent.run() "
-            f"(default: {' '.join(DEFAULT_ALLOWED_HOSTS)}). "
-            "Must include 'poc' and the model endpoint host."
-        ),
-    )
     args = parser.parse_args()
 
     RepairAdapter(
@@ -70,7 +60,6 @@ def main() -> None:
         sample_file=args.sample,
         testset_dir=args.testset,
         agent_image=args.agent_image,
-        allowed_hosts=args.allowed_hosts,
     ).run()
 
 

@@ -69,7 +69,6 @@ from .adapter import (
     BASELINE_REPO_STEPS,
     DATASET_ROOT,
     DEFAULT_AGENT_IMAGE,
-    DEFAULT_ALLOWED_HOSTS,
     STAGED_SENTINEL,
     compose,
 )
@@ -92,10 +91,11 @@ BASELINE_TAG = "harbor-baseline"
 #
 # The agent must not build. Withholding is structural everywhere else in this
 # design -- the resource is not in its container -- but /compile cannot be: the
-# agent needs `poc` allowlisted to run the reproducer, Harbor's allowlist is
-# host-based and rejects ports outright ("not URLs, ports, or paths"), and both
-# endpoints live on the one sidecar. A POST from the agent container reached
-# /compile and started a real build.
+# agent needs `poc` to run the reproducer, and both endpoints live on the one
+# sidecar. A POST from the agent container reached /compile and started a real
+# build. Network policy cannot separate them either: Harbor's allowlist is
+# host-based and rejects ports outright ("not URLs, ports, or paths"), and this
+# stage runs the agent on the public network anyway.
 #
 # So the gate is a token the agent cannot have YET. Harbor uploads `tests/` inside
 # verify() (harbor/verifier/verifier.py:147), after the agent phase has ended, so
@@ -527,7 +527,6 @@ class RepairAdapter:
         sample_file: Path | None = None,
         testset_dir: Path | None = None,
         agent_image: str = DEFAULT_AGENT_IMAGE,
-        allowed_hosts: list[str] | None = None,
     ):
         self.limit = limit
         self.overwrite = overwrite
@@ -536,7 +535,6 @@ class RepairAdapter:
         self.sample_file = Path(sample_file or SAMPLE_FILE)
         self.testset_dir = Path(testset_dir or TESTSET_DIR)
         self.agent_image = agent_image
-        self.allowed_hosts = list(allowed_hosts or DEFAULT_ALLOWED_HOSTS)
         self.output_dir = DATASET_ROOT / DATASET_NAME
 
     def _manifests(self) -> list[dict]:
@@ -709,7 +707,13 @@ class RepairAdapter:
         #     tree. The suite is bounded at TEST_TIMEOUT_SEC in the sidecar, so
         #     the verifier has to outlast it or a slow suite reads as an
         #     infrastructure error.
-        hosts = ", ".join(f'"{h}"' for h in self.allowed_hosts)
+        #   * agent network public, verifier allowlist ["poc"]. This stage
+        #     GENERATES candidate patches; it is not the measurement. The
+        #     measurement is the verifier, and that is where egress stays shut.
+        #     An allowlisted agent buys nothing here and costs a lot: Harbor's
+        #     allowlist chain rejects all non-TCP egress, which on docker >=25
+        #     kills embedded-DNS forwarding and leaves every agent CLI unable to
+        #     resolve its own API. See harbor-overrides/network-policy.
         return f"""version = "1.0"
 
 [task]
@@ -729,8 +733,7 @@ regression_tested = {str(regression_tested).lower()}
 
 [agent]
 timeout_sec = {AGENT_TIMEOUT_SEC}
-network_mode = "allowlist"
-allowed_hosts = [{hosts}]
+network_mode = "public"
 
 [verifier]
 timeout_sec = {VERIFIER_TIMEOUT_SEC}
