@@ -24,9 +24,11 @@ n_attempts: 1
 
 # The binding constraint is the verifier running `arvo compile`, not the agent.
 # Measured safe at 8 and harmful at 16 on the 32-core box, BEFORE the agent could
-# build and run the suite itself; 12 has not been re-measured under that load and
-# is the number to revisit first if trials start timing out.
-n_concurrent_trials: 12
+# build and run the suite itself. 4 because each trial is now TWO builders, not
+# one: the agent compiles and runs the suite in `main` for up to two hours, and
+# the verifier compiles again in `poc`. At 4 CPU apiece that is already most of
+# the box, and a trial that thrashes reads as a model failure, not a machine one.
+n_concurrent_trials: 4
 
 # ---------------------------------------------------------------- agent + model
 # NO `kwargs.version`. Both CLIs are baked into agent-image/ at pinned versions
