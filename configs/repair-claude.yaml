@@ -1,0 +1,99 @@
+# Alternative-patch generation, Claude Code arm. Section 4.1 of the plan.
+#
+# One dataset, two configs. This file and configs/repair-codex.yaml are
+# identical except for the `agents:` block -- everything that could change what an
+# attempt sees or how long it gets is pinned here and in the task.toml, so the two
+# arms are the same search under two generators rather than two experiments.
+#
+#   uv run faultloc-repair
+#   uv run harbor run -c configs/repair-claude.yaml \
+#     -p datasets/flbench-repair-eval50 --job-name repair-claude
+#
+# The generator identity lives in --job-name, not in the dataset: section 5.2
+# requires the audit material to be anonymous, and a dataset per agent would put
+# the name in every task path.
+
+job_name: faultloc-repair
+jobs_dir: jobs
+
+# ONE attempt per instance. This is a search for an existence proof, not a rate:
+# 50 instances x 1 attempt x 2 agents = the 100 planned attempts of section 4.1.
+# A second rollout would make "did this agent find an alternative" ambiguous
+# between the agent and the sampler.
+n_attempts: 1
+
+# The binding constraint is the verifier running `arvo compile`, not the agent.
+# Measured safe at 8 and harmful at 16 on the 32-core box, BEFORE the agent could
+# build and run the suite itself; 12 has not been re-measured under that load and
+# is the number to revisit first if trials start timing out.
+n_concurrent_trials: 12
+
+# ---------------------------------------------------------------- agent + model
+# NO `kwargs.version`. Both CLIs are baked into agent-image/ at pinned versions
+# (@anthropic-ai/claude-code@2.1.220), and Harbor's installed agents skip
+# installation when a satisfying binary is already present -- ClaudeCode.install
+# returns early on `command -v claude` when no version is requested. Setting a
+# version here would add a second place that has to agree with the Dockerfile, and
+# a mismatch against what `claude --version` prints would trigger a fresh npm
+# install, which is the opposite of the intent. The image digest is the pin.
+#
+# Reasoning effort only, matched to the Codex arm. No tool restriction, no turn
+# cap, no thinking budget: Claude Code exposes --allowedTools, --max-turns and
+# MAX_THINKING_TOKENS and Codex exposes none of them, so setting any of them here
+# would make this arm the narrower search of the two. What both harnesses permit
+# is effort and the wall-clock ceiling in task.toml; the tool set is equalized
+# structurally by the shared container instead.
+agents:
+  - name: claude-code
+    model_name: claude-opus-5
+    kwargs:
+      reasoning_effort: high
+
+# ------------------------------------------------------------ time + resources
+# Budgets live in task.toml: agent 7200s, verifier 5400s, 4 CPU, 8 GB. The agent
+# gets two hours because it builds and runs the project's tests itself, and a
+# single `arvo compile` is bounded at 1800s; the verifier gets ninety minutes
+# because it compiles, reproduces and then runs the suite from a clean tree.
+# Size a run from these, not from the compile bound.
+#
+# Multipliers pinned so a stray flag cannot rescale one arm.
+timeout_multiplier: 1.0
+agent_timeout_multiplier: 1.0
+verifier_timeout_multiplier: 1.0
+agent_setup_timeout_multiplier: 1.0
+environment_build_timeout_multiplier: 1.0
+
+environment:
+  # Harbor's default teardown removes the archival ARVO base, forcing a ~3 GB
+  # re-pull per trial.
+  delete: false
+
+  # Raises gost's ~15s relay timeout inside Harbor's egress sidecar. Without it
+  # every trial errors: the verifier POSTs /compile and `arvo compile` runs for
+  # minutes. See README, "Egress timeout override".
+  extra_docker_compose:
+    - harbor-overrides/egress-timeout.compose.yaml
+
+# --------------------------------------------------------------------- retries
+# Only infrastructure is retried. An agent that burns its budget, exits non-zero
+# or concludes no alternative exists has PRODUCED A RESULT -- section 4.1 keeps a
+# model failure as an unsuccessful search attempt, and retrying it would resample
+# until the search succeeded and inflate the funnel.
+retry:
+  max_retries: 3
+  min_wait_sec: 5
+  max_wait_sec: 120
+  include_exceptions:
+    - ApiConnectionError
+    - ApiConnectionClosedError
+    - ApiInternalServerError
+    - ApiOverloadedError
+    - ApiRateLimitError
+    - ApiResponseStalledError
+    - EnvironmentStartTimeoutError
+    - HealthcheckError
+    - NetworkConnectionError
+
+# ------------------------------------------------------------------- task set
+datasets:
+  - path: datasets/flbench-repair-eval50

@@ -8,11 +8,11 @@ brings the environment up and interrogates the agent's container directly.
 Each config is its own dataset, so this walks all four and probes whichever are
 generated -- the comparison is across datasets, not within one.
 
-`repair` is checked here too, against the gold dataset. It is not a fifth
-localization condition: it is the workspace the two families are supposed to
-SHARE, so the same probe is the way to state that. The repair task is the
-full-information diagnosis task plus a report and a verifier-side build, and the
-one endpoint that differs -- /compile -- is asserted absent everywhere else.
+`repair` is checked here too. It is not a fifth localization condition: it is the
+workspace the two families SHARE, so the same probe is the way to state that. The
+repair task is the full-information localization task plus the developer patch
+and a build tool, and the endpoints that differ -- /compile and /test -- are
+asserted unreachable from every localization arm.
 
     python scripts/config_boundaries.py --task-id 42470093
 """
@@ -27,22 +27,42 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from faultloc_adapter.adapter import DATASET_NAMES, DATASET_ROOT  # noqa: E402
-from faultloc_adapter.repair import GOLD_SOURCE, dataset_name  # noqa: E402
+from faultloc_adapter.repair import DATASET_NAME as REPAIR_DATASET  # noqa: E402
 
-# What the agent's container must and must not expose, per config. `repair` is
-# deliberately identical to `main`.
+# What the agent's container must and must not expose, per config.
+#
+# `repair` is the one config that may build. It is checked here rather than
+# trusted because it is the only place the compile token reaches an agent, and
+# the property that matters is not "repair can build" on its own -- it is that
+# NOTHING ELSE can, which only a probe across every config can state: a
+# localization arm that could compile would be measuring a different task.
+# repair ships run_tests.sh for every instance -- a placeholder where no suite has
+# been written yet -- so the tool is asserted PRESENT there and absent everywhere
+# else, in both directions.
 EXPECT = {
-    "main": {"source": True, "poc_file": True, "run_tool": True},
-    "ablation1": {"source": True, "poc_file": True, "run_tool": False},
-    "ablation2": {"source": True, "poc_file": False, "run_tool": True},
-    "sanity": {"source": False, "poc_file": True, "run_tool": True},
-    "repair": {"source": True, "poc_file": True, "run_tool": True},
+    "main": {"source": True, "poc_file": True, "run_tool": True,
+             "build_tool": False, "test_tool": False},
+    "ablation1": {"source": True, "poc_file": True, "run_tool": False,
+                  "build_tool": False, "test_tool": False},
+    "ablation2": {"source": True, "poc_file": False, "run_tool": True,
+                  "build_tool": False, "test_tool": False},
+    "sanity": {"source": False, "poc_file": True, "run_tool": True,
+               "build_tool": False, "test_tool": False},
+    # No reproducer FILE, on purpose: the agent may run it but not read it, so a
+    # patch cannot special-case the input bytes. See repair.py.
+    "repair": {"source": True, "poc_file": False, "run_tool": True,
+               "build_tool": True, "test_tool": True},
 }
 
 PROBE = r"""
 echo "src_entries=$(ls /workspace/src 2>/dev/null | wc -l)"
 echo "poc_file=$([ -s /workspace/poc ] && echo yes || echo no)"
 echo "run_tool=$(command -v run_poc.sh >/dev/null && echo yes || echo no)"
+echo "build_tool=$(command -v build.sh >/dev/null && echo yes || echo no)"
+echo "test_tool=$(command -v run_tests.sh >/dev/null && echo yes || echo no)"
+# The suite the sidecar runs must never be reachable from the agent's tree: the
+# tree is what it tests, and a copy here is a copy the agent can weaken.
+echo "test_script=$([ -e /usr/local/bin/frozen_test.sh ] && echo LEAK || echo absent)"
 # The ARVO filesystem must not be reachable from the agent's container at all.
 echo "arvo_bin=$(command -v arvo >/dev/null && echo LEAK || echo absent)"
 echo "src_root=$([ -d /src ] && echo LEAK || echo absent)"
@@ -73,6 +93,10 @@ echo "poc_frames=$(grep -cE '#[0-9]+ 0x[0-9a-f]+ in .+ /.+:[0-9]+' /tmp/rp.log 2
 COMPILE_PROBE = r"""
 echo "compile_endpoint=$(curl -s -X POST -o /dev/null -w '%{http_code}' http://poc:8080/compile)"
 echo "compile_token_file=$([ -e /tests/compile_token ] && echo LEAK || echo absent)"
+# /test is refused for everyone at agent time: 404 where no suite was staged,
+# 403 where one was and the token has not arrived yet. The assertion is that it
+# is never 200 -- which is the property, and the one form that covers both.
+echo "test_endpoint=$(curl -s -X POST -o /dev/null -w '%{http_code}' http://poc:8080/test)"
 """
 
 
@@ -117,6 +141,13 @@ def check_one(task_dir: Path, config: str, agent_image: str) -> dict:
             "source": (int(p.get("src_entries", "0") or 0) > 0) == want["source"],
             "poc_file": (p.get("poc_file") == "yes") == want["poc_file"],
             "run_tool": (p.get("run_tool") == "yes") == want["run_tool"],
+            # The whole point of the probe: a build tool exists for repair and
+            # for nothing else. Its absence elsewhere is what keeps repair's
+            # one-attempt-no-oracle measurement true.
+            "build_tool": (p.get("build_tool") == "yes") == want["build_tool"],
+            # None means "may or may not be present" -- see EXPECT.
+            "test_tool": (p.get("test_tool") == "yes") == want["test_tool"],
+            "no_test_script": p.get("test_script") == "absent",
             # A withheld resource must be unreachable, not merely absent.
             "poc_endpoint": (p.get("poc_endpoint") == "200") == want["poc_file"],
             "run_endpoint": (p.get("run_endpoint") == "200") == want["run_tool"],
@@ -138,10 +169,14 @@ def check_one(task_dir: Path, config: str, agent_image: str) -> dict:
         # No build for the agent, over the network either: localization has no
         # PROJECT and so no endpoint, repair has one but the token that opens it
         # is not in the container yet.
+        # The probe never presents a token, so a token-gated endpoint answers 403
+        # whether or not the agent could open it -- which is why `build_tool`
+        # above, not this, is what distinguishes repair from localization.
         checks["no_compile"] = p.get("compile_endpoint") == (
-            "403" if config == "repair" else "404"
+            "403" if config in ("repair", "repair") else "404"
         )
         checks["no_compile_token"] = p.get("compile_token_file") == "absent"
+        checks["no_test_endpoint"] = p.get("test_endpoint") != "200"
         if want["run_tool"]:
             # The reproducer must still work where it is offered.
             checks["poc_reproduces"] = int(p.get("poc_frames", "0") or 0) > 0
@@ -175,11 +210,7 @@ def main() -> int:
     results = []
     for config in EXPECT:
         if config == "repair":
-            # gold stands for the family: repair datasets differ only by the
-            # report, which repair_boundaries.py checks and no probe here reads.
-            task_dir = (
-                args.datasets / dataset_name(GOLD_SOURCE) / f"repair__{args.task_id}"
-            )
+            task_dir = args.datasets / REPAIR_DATASET / f"repair__{args.task_id}"
         else:
             task_dir = args.datasets / DATASET_NAMES[config] / f"faultloc__{args.task_id}"
         if not task_dir.exists():

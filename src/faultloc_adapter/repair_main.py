@@ -1,57 +1,52 @@
 """Entry point for the repair task family (`faultloc-repair`).
 
-Separate from main.py because the two families take different options: repair is
-parameterized by the report source rather than by an ablation config, and takes a
-directory of authored root-cause reports.
+One invocation generates the ONE dataset both generation agents run:
 
-One invocation generates ONE dataset, for one report source:
+    uv run faultloc-repair
 
-    uv run faultloc-repair --source gold --reports reports/gold
-    uv run faultloc-repair --source diagnosis-qwen3.6-27b \\
-        --reports reports/diagnosis-qwen3.6-27b
-
-The output directory is derived from the source, so a run cannot file one
-source's tasks under another's name. See repair.py for the source vocabulary.
+There is no `--source`: the task carries the developer patch itself rather than
+an external report, and the generator identity belongs to the Harbor job rather
+than to the task. See repair.py.
 """
 
 import argparse
 from pathlib import Path
 
 from .adapter import DEFAULT_AGENT_IMAGE, DEFAULT_ALLOWED_HOSTS
-from .repair import GOLD_SOURCE, RepairAdapter
+from .repair import RepairAdapter
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--source",
-        required=True,
-        help=(
-            f"Report source this dataset is built from: '{GOLD_SOURCE}', or "
-            "'diagnosis-<model-id>' naming the localization model whose "
-            "predictions the reports are (e.g. diagnosis-qwen3.6-27b). Use the "
-            "served model id, lowercased with the org prefix dropped -- not a "
-            "gateway alias, which can be repointed at another checkpoint."
-        ),
-    )
-    parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Generate only the first N instances (every source gets the same N)",
+        help="Generate only the first N sampled instances (sample order, not task order)",
     )
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--task-ids", nargs="+", default=None)
+    parser.add_argument(
+        "--task-ids",
+        nargs="+",
+        default=None,
+        help="Instance ids to generate; must be inside the frozen eval50 sample",
+    )
     parser.add_argument("--manifest-dir", type=Path, default=None)
     parser.add_argument(
-        "--reports",
+        "--sample",
+        type=Path,
+        default=None,
+        help="Frozen sample manifest (default: data/alternative-patch-eval50.json)",
+    )
+    parser.add_argument(
+        "--testset",
         type=Path,
         default=None,
         help=(
-            "Directory of this source's root-cause reports, one per instance as "
-            "<dir>/<local_id>.json. Required: no report is derivable from the "
-            "manifest, and a source that cannot find its reports is an error, "
-            "not a fallback."
+            "Per-instance test scripts (default: data/testset). Every instance "
+            "ships one; where none has been written the generator seeds a "
+            "placeholder that always fails, so that instance rejects every "
+            "candidate until a real script replaces it."
         ),
     )
     parser.add_argument("--agent-image", default=DEFAULT_AGENT_IMAGE)
@@ -68,12 +63,12 @@ def main() -> None:
     args = parser.parse_args()
 
     RepairAdapter(
-        args.source,
-        overwrite=args.overwrite,
         limit=args.limit,
+        overwrite=args.overwrite,
         task_ids=args.task_ids,
         manifest_dir=args.manifest_dir,
-        reports_dir=args.reports,
+        sample_file=args.sample,
+        testset_dir=args.testset,
         agent_image=args.agent_image,
         allowed_hosts=args.allowed_hosts,
     ).run()

@@ -37,8 +37,8 @@ backwards is the easiest way to break the benchmark:
 Widening only one side of a comparison is a silent no-op, and widening twice is
 idempotent -- so a mistake here does not raise, it just collapses the parity
 column into the headline and the numbers still look plausible. That is why every
-caller goes through this module and why scripts/check_anchoring.py asserts each
-stage's headline rule behaviourally rather than checking imports.
+caller goes through this module rather than reaching past it: one entry point
+is what makes the two stages' rules inspectable at all.
 """
 
 try:  # inside a verifier image the scorer sits next to this file
@@ -55,8 +55,7 @@ def parse_diff_flbench(diff_text: str) -> list[Hunk]:
     Never use this to build ground truth -- it exists so a scorer can emit the
     published-FLBench value alongside the locked one, and so the delta between
     them measures the anchoring bias. Routed through here rather than importing
-    parse_diff directly so scripts/check_anchoring.py can keep enforcing a single
-    entry point.
+    parse_diff directly, so widening stays in one place.
     """
     return _parse_diff(diff_text)
 

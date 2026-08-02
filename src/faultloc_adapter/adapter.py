@@ -51,6 +51,16 @@ DEFAULT_AGENT_IMAGE = "faultloc-agent:v1"
 # unaffected. Docker 29 does not exhibit this; the evaluation box runs 25.0.14.
 # Keep the hostname so the entry survives a Docker upgrade, and keep the address so
 # the run works before one. Both are ephemeral: an EC2 replacement changes them.
+# TWO self-hosted endpoints are listed, and a run reaches whichever OPENAI_BASE_URL
+# names -- the allowlist only decides what is reachable, never what is dialled.
+# Both are here so a batch can move between them without regenerating datasets,
+# which would otherwise change every task.toml mid-experiment.
+#
+# The NRP entry widens this more than it looks: 137.164.28.180 is NRP's shared
+# ingress, so allowlisting it also reaches the S3 pools and everything else behind
+# that address. Accepted here because both agents are cooperative and the archival
+# fix is already withheld structurally (STRIP_ARCHIVAL_GIT), not because the
+# address is narrow.
 DEFAULT_ALLOWED_HOSTS = (
     "poc",
     "api.anthropic.com",
@@ -59,6 +69,8 @@ DEFAULT_ALLOWED_HOSTS = (
     "auth.openai.com",
     "ec2-16-56-22-55.compute-1.amazonaws.com",
     "172.31.96.73",
+    "ellm.nrp-nautilus.io",
+    "137.164.28.180",
 )
 
 POC_TIMEOUT_SEC = 120
@@ -414,124 +426,13 @@ memory_mb = 4096
 """
 
     def _compose(self, manifest: dict, caps: dict, config: str) -> str:
-        # Compose interpolates ${...} in the YAML before the shell ever sees it,
-        # so a bare $ in the staging script silently becomes an empty string.
-        staging = _staging_command(caps).replace("$", "$$")
-        indented = "\n".join("        " + line for line in staging.splitlines())
-        arvo = manifest["image"]
-        project = manifest["project"]
-        server = "\n".join(
-            "        " + line
-            for line in (_REPO_ROOT / "sidecar" / "server.py").read_text().splitlines()
+        return compose(
+            manifest,
+            _staging_command(caps),
+            source=caps["source"],
+            environment={"EVAL_CONFIG": config, "TIMEOUT": str(POC_TIMEOUT_SEC)},
         )
 
-        # sanity withholds the source by never populating the shared volume, so
-        # the agent container -- which has no /src of its own -- genuinely has none.
-        if caps["source"]:
-            source_stage = "\n".join(
-                "        " + line
-                for line in (
-                    f"cp -a /src/{project}/. /shared/",
-                    # No `|| true`: a failed clean leaves image build output in the
-                    # tree, the baseline commits it, and the trial runs on a state
-                    # no other trial shares. Under `set -eu` the staging shell dies
-                    # instead, the sentinel is never written and Harbor errors the
-                    # trial. stderr is left connected so the reason reaches the logs.
-                    "git -C /shared clean -fdx >/dev/null",
-                    # Order matters: clean needs the archival index, so the
-                    # history goes only after it has run.
-                    STRIP_ARCHIVAL_GIT,
-                )
-            )
-        else:
-            # sanity: leave the volume empty; the agent image has no source of its own.
-            source_stage = "        true"
-
-        return f"""# Split design, mirroring FLBench's eval job: the agent runs in `main`, which
-# contains no source, PoC or reproducer of its own, and the ARVO image is confined
-# to the `poc` sidecar. Withholding a resource is therefore structural -- the agent
-# cannot reach what was never put in its container -- which is what makes the
-# ablation configs enforceable.
-services:
-  main:
-    # tini as PID 1 forwards SIGTERM; without it the staging shell's `exec`ed
-    # process ignores it and docker waits out the full 10s grace period on every
-    # teardown (measured: 21s -> 1s for the stack).
-    init: true
-    volumes:
-      - "src:/workspace/src"
-    # Gates readiness on the sentinel staging writes last. `up --wait` otherwise
-    # returns as soon as /bin/sh starts, letting the agent begin before
-    # /workspace/poc exists.
-    healthcheck:
-      test: ["CMD", "test", "-f", "{STAGED_SENTINEL}"]
-      interval: 2s
-      timeout: 5s
-      retries: 300
-      start_period: 3s
-    depends_on:
-      poc:
-        condition: service_healthy
-    command:
-      - /bin/sh
-      - -c
-      - |
-{indented}
-
-  # Holds /out, /tmp/poc and the reproducer, and stages the source onto the shared
-  # volume. The copy lives here rather than in a one-shot service because the volume
-  # is tmpfs: it exists only while a container has it mounted, and this sidecar is up
-  # for the whole trial. The mount point is an empty path, never /src/<project>, so
-  # Docker cannot prepopulate the volume from the image behind the config's back.
-  # The agent never sees this filesystem; it reaches the PoC only over HTTP.
-  poc:
-    init: true
-    # The server disables ASLR so MSan's fixed shadow ranges cannot collide with a
-    # randomly placed mapping (see sidecar/server.py:_disable_aslr). Docker's default
-    # seccomp profile denies the personality syscall with EPERM, so the call is a
-    # no-op without this. Scoped to the sidecar; the agent container keeps the
-    # default profile.
-    security_opt:
-      - seccomp=unconfined
-    environment:
-      EVAL_CONFIG: "{config}"
-      TIMEOUT: "{POC_TIMEOUT_SEC}"
-    image: {arvo}
-    networks: [default]
-    volumes:
-      - "src:/shared"
-    command:
-      - /bin/sh
-      - -c
-      - |
-        set -eu
-{source_stage}
-        cat > /tmp/server.py <<'SERVER_EOF'
-{server}
-        SERVER_EOF
-        exec python3 /tmp/server.py
-    healthcheck:
-      test: ["CMD", "python3", "-c",
-             "import urllib.request;urllib.request.urlopen('http://localhost:8080/health')"]
-      interval: 2s
-      timeout: 5s
-      retries: 150
-      start_period: 3s
-
-volumes:
-  # tmpfs-backed so the staged source lives in RAM, not on disk. Harbor's
-  # `delete: false` teardown runs a plain `docker compose down`, which keeps named
-  # volumes -- with a disk-backed volume every trial would leak a full source tree
-  # (measured: ~120MB each, unbounded across trials). Here teardown unmounts the
-  # tmpfs and the memory is released; only an empty volume object remains. `size`
-  # is a ceiling, not an allocation, so it costs nothing until written.
-  src:
-    driver: local
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
-      o: size=4g
-"""
 
     def _write_solution(self, task_dir: Path, manifest: dict) -> None:
         spans = json.dumps(_oracle_spans(manifest["gt_diff"]), indent=2)
@@ -575,3 +476,163 @@ cat /logs/artifacts/prediction.json
             "cat /logs/verifier/reward.json\n"
         )
         test_sh.chmod(0o755)
+
+
+def compose(
+    manifest: dict,
+    staging_command: str,
+    *,
+    source: bool = True,
+    environment: dict[str, str] | None = None,
+    sidecar_setup: str = "",
+) -> str:
+    """The agent/sidecar environment. One copy, used by every family.
+
+    The sidecar half -- ARVO image, build tree, reproducer, tmpfs volume -- is
+    the same environment for localization and for repair, and a second copy of
+    it would be a second thing to keep in step. A drift between two copies is
+    also exactly what the boundary gates cannot see: they compare datasets
+    within a family, never across two.
+
+    Only three things vary, and each is a parameter. `staging_command` is the
+    AGENT half -- which tools it gets, whether the reproducer file is staged.
+    `source` is sanity's withholding switch: leave the shared volume empty and
+    the agent container, which has no /src of its own, genuinely has none.
+    `environment` is the sidecar's own configuration, including the switches
+    that make withholding hold over the NETWORK rather than only on disk --
+    not staging the reproducer leaves /poc-file serving the same bytes to
+    anything that can reach the sidecar, and `curl http://poc:8080/poc-file` is
+    one line.
+
+    `sidecar_setup` runs in the sidecar after the tree is staged and before the
+    server starts. The frozen regression suite is placed with it: the suite has
+    to reach the sidecar and must NOT reach the agent's tree, since the tree is
+    what it tests.
+    """
+    # Compose interpolates ${...} in the YAML before the shell ever sees it,
+    # so a bare $ in the staging script silently becomes an empty string.
+    staging = staging_command.replace("$", "$$")
+    indented = "\n".join("        " + line for line in staging.splitlines())
+    arvo = manifest["image"]
+    project = manifest["project"]
+    server = "\n".join(
+        "        " + line
+        for line in (_REPO_ROOT / "sidecar" / "server.py").read_text().splitlines()
+    )
+    env_block = "".join(
+        f'\n      {key}: "{value}"' for key, value in (environment or {}).items()
+    )
+    setup = "".join(
+        "        " + line + "\n" for line in sidecar_setup.replace("$", "$$").splitlines()
+    )
+
+    if source:
+        source_stage = "\n".join(
+            "        " + line
+            for line in (
+                f"cp -a /src/{project}/. /shared/",
+                # No `|| true`: a failed clean leaves image build output in the
+                # tree, the baseline commits it, and the trial runs on a state
+                # no other trial shares. Under `set -eu` the staging shell dies
+                # instead, the sentinel is never written and Harbor errors the
+                # trial. stderr is left connected so the reason reaches the logs.
+                "git -C /shared clean -fdx >/dev/null",
+                # Order matters: clean needs the archival index, so the
+                # history goes only after it has run.
+                STRIP_ARCHIVAL_GIT,
+            )
+        )
+    else:
+        # sanity: leave the volume empty; the agent image has no source of its own.
+        source_stage = "        true"
+
+    # WHY THE FILE BELOW LOOKS THE WAY IT DOES. The rationale lives here rather
+    # than in the emitted YAML: the YAML is a generated artifact written once per
+    # task, and prose repeated across every copy is noise in a diff and cannot be
+    # corrected in place -- the source is the only place worth explaining it.
+    #
+    #   * SPLIT DESIGN, mirroring FLBench's eval job. The agent runs in `main`,
+    #     which contains no source, PoC or reproducer of its own; the ARVO image
+    #     is confined to the `poc` sidecar. Withholding is therefore structural
+    #     -- the agent cannot reach what was never put in its container -- which
+    #     is what makes the ablation configs enforceable.
+    #   * `init: true` gives tini as PID 1, which forwards SIGTERM. Without it
+    #     the staging shell's `exec`ed process ignores it and docker waits out
+    #     the full 10s grace period on every teardown (measured: 21s -> 1s).
+    #   * The `main` HEALTHCHECK gates on the sentinel staging writes last.
+    #     `up --wait` otherwise returns as soon as /bin/sh starts, letting the
+    #     agent begin before /workspace/poc exists.
+    #   * The SIDECAR holds /out, /tmp/poc and the reproducer, and stages the
+    #     source onto the shared volume. The copy lives there rather than in a
+    #     one-shot service because the volume is tmpfs: it exists only while a
+    #     container has it mounted, and this sidecar is up for the whole trial.
+    #     Its mount point is an empty path, never /src/<project>, so Docker
+    #     cannot prepopulate the volume from the image behind the config's back.
+    #   * `seccomp=unconfined` on the sidecar only: the server disables ASLR so
+    #     MSan's fixed shadow ranges cannot collide with a randomly placed
+    #     mapping (sidecar/server.py:_disable_aslr), and Docker's default profile
+    #     denies the personality syscall with EPERM. The agent container keeps
+    #     the default profile.
+    #   * The `src` VOLUME is tmpfs so the staged source lives in RAM. Harbor's
+    #     `delete: false` teardown runs a plain `docker compose down`, which
+    #     keeps named volumes -- disk-backed, every trial would leak a full
+    #     source tree (~120MB each, unbounded). `size` is a ceiling, not an
+    #     allocation, so it costs nothing until written.
+    return f"""# Generated by faultloc_adapter/adapter.py -- do not edit.
+# Design and rationale: src/faultloc_adapter/adapter.py, compose().
+services:
+  main:
+    init: true
+    volumes:
+      - "src:/workspace/src"
+    healthcheck:
+      test: ["CMD", "test", "-f", "{STAGED_SENTINEL}"]
+      interval: 2s
+      timeout: 5s
+      retries: 300
+      start_period: 3s
+    depends_on:
+      poc:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - |
+{indented}
+
+  poc:
+    init: true
+    security_opt:
+      - seccomp=unconfined
+    environment:{env_block}
+    image: {arvo}
+    networks: [default]
+    volumes:
+      - "src:/shared"
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+{source_stage}
+{setup}        cat > /tmp/server.py <<'SERVER_EOF'
+{server}
+        SERVER_EOF
+        exec python3 /tmp/server.py
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request;urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 2s
+      timeout: 5s
+      retries: 150
+      start_period: 3s
+
+volumes:
+  src:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4g
+"""
+

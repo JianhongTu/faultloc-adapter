@@ -29,7 +29,8 @@ uv run python scripts/check_egress_override.py
 
 `manifests/` and `reports/gold/` are extraction targets, not sources: the archive is the
 artifact, and those directories are rebuilt from it. Remove them first so what is on disk
-is exactly what the archive holds.
+is exactly what the archive holds. Only `manifests/` is read by anything today — the gold
+reports were stage 2's input and that path is retired; the archive still carries them.
 
 `FAULTLOC_ROOT` is not optional and every `harbor run` must be invoked from the repo
 root; both are checked by `check_egress_override.py`. Run it once per shell before any
@@ -86,7 +87,7 @@ override, without which any reproducer slower than gost's cut-off is hung up on
 mid-run: `run_poc.sh` catches only `HTTPError`, so the resulting
 `RemoteDisconnected` escapes as a traceback with exit 1 — which its own contract
 reads as *still crashes*. PoC execution is then unavailable for those instances,
-on the condition that gets frozen into `reports/`. See "Egress timeout override"
+on that condition. See "Egress timeout override"
 below. It also pins one attempt,
 concurrency, the retry allowlist and `environment.delete: false`; that last one
 keeps Harbor's teardown from removing the archival ARVO base and re-pulling
@@ -101,102 +102,174 @@ artifacts/logs/artifacts/prediction.json
 artifacts/logs/artifacts/summary.txt
 ```
 
-For the repair experiment, freeze the main-condition output as one report per instance
-under `reports/diagnosis-$DIAGNOSIS_ID/`. Each report has this schema:
+`line_end` is exclusive in `prediction.json`, matching the vendored scorer.
 
-```json
-{
-  "report_id": "provider-model-version-42470093",
-  "instance_id": 42470093,
-  "locations": [
-    {"file": "src/example.c", "line_start": 10, "line_end": 12}
-  ],
-  "cause": "One sentence explaining the root cause and where it occurs."
-}
-```
+These are stage 1's result. Nothing downstream reads them: the family that consumed
+reports is retired (step 4), and the tools that turned raw output into `reports/<source>/`
+went with it.
 
-`line_end` is exclusive. Preserve an empty `locations` list when the diagnosis model names
-no location; the repair generator records that instance as not run and scores it as zero.
+### 4. Run the repair stage
 
-### 4. Generate and validate repair datasets
+The report-driven repair family — one dataset per report source, scored on whether the
+patch landed at the reported location — is **retired**. It is in git history; the CLI no
+longer offers `--source` or `--reports`, and the config that pinned its implementation
+agent has been removed.
 
-Generate the gold ceiling once:
+Its successor is the study below, which asks a different question of the same instances:
+not whether a report helps an agent fix the bug, but whether the developer's location is
+the only place the bug can be fixed. See **Alternative-patch study**.
 
-```bash
-uv run faultloc-repair --source gold --reports reports/gold
+## Alternative-patch study
 
-uv run python scripts/repair_boundaries.py \
-  --tasks datasets/flbench-repair-eval500-gold
-uv run python scripts/check_anchoring.py \
-  --tasks datasets/flbench-repair-eval500-gold
-```
+A bounded sensitivity analysis, separate from the two-stage experiment above. The repair
+and localization results both treat the accepted developer patch as the only correct
+location; this asks whether that assumption changes the ranking. Two strong agents are
+asked to repair the same defect *outside* the developer-patch spans, and a candidate is
+accepted only if it is mechanically executable and lands somewhere else.
 
-Then generate one repair dataset for each fixed diagnosis report set:
+The sample is 50 of the locked 500 — 10%, proportionally stratified by sanitizer and by
+developer-patch topology (single- versus multi-hunk), ordered within a stratum by
+`sha256("20260731:<local_id>")`. It is frozen in `data/alternative-patch-eval50.json` and
+was selected before any patch was generated:
 
 ```bash
-SOURCE="diagnosis-$DIAGNOSIS_ID"
-
-uv run faultloc-repair \
-  --source "$SOURCE" \
-  --reports "reports/$SOURCE"
-
-uv run python scripts/repair_boundaries.py \
-  --tasks "datasets/flbench-repair-eval500-$SOURCE"
+uv run python scripts/select_repair_eval50.py --check
 ```
 
-The boundary check must pass before running the implementation agent. It verifies that a
-diagnosis dataset differs from gold only in the supplied report.
-
-### 5. Run the fixed implementation agent
-
-`configs/repair-eval.yaml` pins the implementation agent, `qwen3-small`, Qwen Code version,
-timeouts, retries, concurrency, and three independent attempts per instance. Configure its
-OpenAI-compatible endpoint in `.env`:
+The ordering nests, so raising the target keeps the instances already run.
 
 ```bash
-OPENAI_API_KEY=...
-OPENAI_BASE_URL=...
+uv run faultloc-repair
 ```
 
-Load the environment, inspect the resolved configuration, and run gold:
+One dataset, `datasets/flbench-repair-eval50`, run once per generating agent:
 
 ```bash
-set -a
-. .env
-set +a
+uv run harbor run -c configs/repair-codex.yaml \
+  -p datasets/flbench-repair-eval50 --job-name repair-codex
 
-uv run harbor run \
-  -c configs/repair-eval.yaml \
-  -p datasets/flbench-repair-eval500-gold \
-  --print-config
-
-uv run harbor run \
-  -c configs/repair-eval.yaml \
-  -p datasets/flbench-repair-eval500-gold \
-  --job-name repair-gold
+uv run harbor run -c configs/repair-claude.yaml \
+  -p datasets/flbench-repair-eval50 --job-name repair-claude
 ```
 
-Run the same fixed configuration for every diagnosis report set:
+**Do not `. .env` before these.** That file carries `OPENAI_BASE_URL` for the repair
+stage's self-hosted gateway, and Harbor's Codex adapter forwards `OPENAI_BASE_URL`
+whenever it is set — including under `auth.json` authentication — so a sourced `.env`
+silently aims Codex at an endpoint that does not serve its model. Codex defaults to
+`OPENAI_API_KEY`; to use a ChatGPT subscription instead, set `CODEX_FORCE_AUTH_JSON=1`
+with `~/.codex/auth.json` in place, and leave `OPENAI_BASE_URL` unset either way. Claude
+Code needs `ANTHROPIC_API_KEY`, or `CLAUDE_CODE_OAUTH_TOKEN` with `CLAUDE_FORCE_OAUTH=1`.
+
+Before either arm, run the preconditions: the oracle applies the developer patch on the
+same path a candidate takes, so it proves the instance builds and the PoC is suppressible
+without spending an API call.
 
 ```bash
-uv run harbor run \
-  -c configs/repair-eval.yaml \
-  -p "datasets/flbench-repair-eval500-$SOURCE" \
-  --job-name "repair-$SOURCE"
+export FAULTLOC_ROOT="$PWD"
+uv run harbor run -c configs/repair-codex.yaml \
+  -p datasets/flbench-repair-eval50 -a oracle \
+  -i 'repair__<id>' --job-name repair-precondition
 ```
 
-Harbor writes results and the resolved task/configuration lock under `jobs/<job-name>/`.
-Generated datasets and jobs are disposable execution artifacts; the locked manifests,
-gold reports, and each frozen diagnosis report set are the experiment inputs.
+Both agents get byte-identical tasks by construction — the generator identity lives in the
+job name, not in the dataset, because the later audit reads the candidates anonymously.
+Neither config pins a CLI version: both agents are baked into `agent-image/` at exact
+versions and Harbor skips installation when a satisfying binary is present, so the image is
+the pin and a second one here could only disagree with it.
 
-The repair verifier reports:
+The environment is the localization stage's, with the agent half replaced: the reproducer
+is withheld as a *file* while remaining runnable, and the agent gets `build.sh` and
+`run_tests.sh`. `adapter.compose()` builds both, so the sidecar half cannot drift between
+them, and `scripts/config_boundaries.py` carries a `repair` entry asserting no
+localization config has either tool. The developer patch reaches the agent through the
+prompt rather than through the container.
 
-- `repair_ok`: the patch exists, compiles, and suppresses the PoC.
-- `at_location`: at least one repair-patch hunk overlaps a reported location.
-- `verified` and `reward`: `repair_ok AND at_location`.
+### Regression suites
 
-Compare each diagnosis report set with the gold ceiling using `verified`; retain
-`repair_ok` to distinguish unattributed repairs from unsuccessful repairs.
+Building and suppressing the reproducer is not evidence of a repair. The 3-instance smoke
+produced three candidates that passed every mechanical gate, and one of them broke
+libxml2's own suite — 3158 checks clean before the patch, 2 errors after. So each instance
+runs the project's own tests.
+
+**Each suite is written by hand, and there is no way around that.** ARVO images carry the
+source and a fuzzer build, never a configured test build: the tests are present but
+nothing can run them until someone writes the configure-and-build recipe for that project.
+Detection cannot substitute — a probe across all 50 trees finds a test declaration in 25 of
+them, and aom is in the other 25 despite running 4081 tests. OSS-Fuzz (Chronos
+`run_tests.sh`) and e2e-cyber-bench (`test.sh`) both hand-write it per project, and neither
+attempts detection.
+
+Generation therefore writes a **placeholder** to `data/testset/<id>/test.sh` for any
+instance without a frozen suite, and says so:
+
+```
+regression suites: 0 authored and frozen, 50 PLACEHOLDER, of 50 generated task(s)
+
+  DO NOT LAUNCH. 50 instance(s) have no test suite.
+```
+
+The placeholder exits non-zero, always. Exiting 0 would make an unauthored instance look
+like a project whose tests all pass, which is the one reading that must never happen — the
+verifier reads this exit code, so an unauthored dataset rejects every candidate rather than
+quietly accepting them ungated.
+
+**The contract is "exit 0 when the result matches the unpatched tree", not "the suite is
+green."** Two of the three instances measured by hand are red before anything is patched —
+open62541 fails 2 of 31, aom 2 of 4081 — so a green-suite rule would reject the developer's
+own patch. The author encodes the expected result in the script; the verifier reads one
+number, and `tests.log` keeps the suite's full output for whoever reads a rejection.
+
+The script is self-contained: nothing outside it records which tests exist or how they
+behaved, because a second copy of that knowledge is a second thing to keep in step. A
+script counts as authored when it is not byte-identical to the placeholder — there is no
+status to set and no record to keep in sync. `faultloc-repair` prints
+`test suites: N authored, M PLACEHOLDER`, and `task.toml` records `regression_tested` per
+instance so the two halves are never pooled.
+
+### Outcomes
+
+Each trial is labelled with one mechanical outcome, emitted one-hot into `reward.json` so a
+job's mean is the funnel directly:
+
+| Outcome | Meaning |
+| --- | --- |
+| `no_patch` | the agent reported no alternative exists, or left nothing in the tree |
+| `build_failed` | changed the source, but it does not compile |
+| `poc_failed` | compiles, reproducer still crashes |
+| `regression_detected` | the test script exited non-zero — see below |
+| `executable_candidate` | compiles, suppresses the PoC, test script exits 0 |
+
+`reward` is 1 only for `executable_candidate`. Structured evidence — every changed file,
+which lines collided, the suite's exit code — goes to
+`artifacts/logs/artifacts/mechanical.json` alongside `patch.diff`, `changed_spans.json`,
+`compile.log`, `poc.log` and `tests.log`.
+
+**`regression_detected` has two causes and they are not the same result.** The candidate
+broke something, OR no test script has been written for that instance yet and the
+placeholder failed as designed. Check `regression_tested` in `task.toml` before reading
+this row: `false` means the instance was never authored and every candidate on it lands
+here regardless of what it did. `tests.log` shows which, and an unauthored instance says
+so in as many words.
+
+Otherwise `regression_detected` is reported separately and never folded into a generic
+rejection. It is a distinct way to reach "no accepted reference" — alongside no candidate
+found, a candidate rejected on substance, and a candidate rejected for want of evidence —
+and averaging them together would report a search failure that did not happen.
+
+`executable_candidate` is **not** the claim that an alternative repair exists. It
+establishes only that the patch is executable and elsewhere; whether it repairs the root
+cause rather than suppressing the symptom is a separate audit that reads these artifacts.
+
+Each task's `solution/solve.sh` applies the developer patch. It is the per-instance
+precondition check — read `compiled` and `poc_suppressed` from it, not `reward`. Its
+`gold_overlap` is 1 by construction, since the patch sits on its own spans.
+
+**Overlap with the developer's patch is measured, not gated.** `gold_overlap` and the
+`gold_*` metrics record how far a candidate sits from the developer's lines, and the audit
+decides whether that distance makes it a different repair. An exact line intersection
+answers a narrower question: anchoring puts an insertion on two candidate lines, so a fix
+one line off the developer's edit collides while a fix ten lines away that reimplements the
+same idea does not.
 
 ## Egress timeout override
 
@@ -213,6 +286,9 @@ without response` — the agents had produced valid patches, and nothing scored.
 is exposed the same way for any reproducer slower than 15s, including localization's
 `run_poc.sh`. There the same `RemoteDisconnected` escapes uncaught — `run_poc.sh` handles
 only `HTTPError` — and exits 1, which its own contract reads as "still crashes".
+`POST /test` is the longest of the three and depends on the same override: a suite is
+bounded at 1800s in the sidecar, well inside the raised 3600s but two orders of magnitude
+outside the default.
 
 Measured through the sidecar, a response after 10s arrives and 20s/30s/60s are all killed
 at exactly 15s; the same requests bypassing the sidecar succeed at 60s.

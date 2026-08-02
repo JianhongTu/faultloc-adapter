@@ -8,7 +8,7 @@
 #     --job-name "flbench-diagnosis-eval500-main-$DIAGNOSIS_ID"
 #
 # ONE JOB PER DATASET -- tasks are named for the instance alone, so two conditions
-# pooled into one job would collide. `configs/repair-eval.yaml` is the stage-2
+# pooled into one job would collide. `configs/repair-codex.yaml` is the stage-2
 # counterpart and pins its agent, because there the agent is the fixed thing.
 
 job_name: faultloc-diagnosis
