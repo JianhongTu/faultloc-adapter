@@ -61,6 +61,11 @@ DEFAULT_AGENT_IMAGE = "faultloc-agent:v1"
 # that address. Accepted here because both agents are cooperative and the archival
 # fix is already withheld structurally (STRIP_ARCHIVAL_GIT), not because the
 # address is narrow.
+#
+# api.z.ai is Zhipu's OpenAI-compatible endpoint, dialled through OPENAI_BASE_URL
+# the same way the self-hosted ones are. It is fronted by a CDN, so the two
+# addresses here are what it resolved to when this was written, not a fixed pair;
+# re-resolve before a batch if the run cannot reach the model.
 DEFAULT_ALLOWED_HOSTS = (
     "poc",
     "api.anthropic.com",
@@ -71,6 +76,9 @@ DEFAULT_ALLOWED_HOSTS = (
     "172.31.96.73",
     "ellm.nrp-nautilus.io",
     "137.164.28.180",
+    "api.z.ai",
+    "128.14.14.140",
+    "128.14.14.141",
 )
 
 POC_TIMEOUT_SEC = 120
