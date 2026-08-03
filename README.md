@@ -1,8 +1,8 @@
 # faultloc-adapter
 
 `faultloc-adapter` evaluates whether a root-cause report helps a separate agent repair a
-vulnerability. The benchmark uses a locked, category-balanced set of 500 validated FLBench
-instances. Diagnosis models first produce locations and a causal explanation under the main
+vulnerability. The benchmark uses a locked set of 900 validated FLBench
+instances — FLBench's own eval list. Diagnosis models first produce locations and a causal explanation under the main
 condition and three ablations; a fixed implementation agent (`qwen-coder` with
 `qwen3-small`, served as `Qwen/Qwen3.6-27B`) then attempts each repair from either a
 diagnosis model's report or a developer-patch-anchored gold report. Gold is the baseline and
@@ -19,28 +19,38 @@ Requirements: Linux, Docker, and [`uv`](https://docs.astral.sh/uv/).
 uv sync
 docker build -t faultloc-agent:v1 agent-image/
 
-sha256sum -c data/eval500.tar.gz.sha256
-rm -rf manifests reports/gold
-tar -xzf data/eval500.tar.gz
+sha256sum -c data/eval900.tar.gz.sha256
+rm -rf manifests
+tar -xzf data/eval900.tar.gz
 
 export FAULTLOC_ROOT="$PWD"          # see "Egress timeout override" below
 uv run python scripts/check_egress_override.py
 ```
 
-`manifests/` and `reports/gold/` are extraction targets, not sources: the archive is the
-artifact, and those directories are rebuilt from it. Remove them first so what is on disk
-is exactly what the archive holds. Only `manifests/` is read by anything today — the gold
-reports were stage 2's input and that path is retired; the archive still carries them.
+`manifests/` is an extraction target, not a source: the archive is the artifact and the
+directory is rebuilt from it. Remove it first so what is on disk is exactly what the
+archive holds. The superseded `data/eval500.tar.gz` is kept because it is the only copy
+of the 500 gold reports that fed the retired report-driven stage; nothing reads them, and
+they were never regenerable — their `cause` text was model-written, not derived.
 
 `FAULTLOC_ROOT` is not optional and every `harbor run` must be invoked from the repo
 root; both are checked by `check_egress_override.py`. Run it once per shell before any
 batch — the failure it prevents costs a whole run, not a trial.
 
-The archive contains exactly 500 manifests and their 500 gold reports — the complete
-frozen input. The manifests pin the archival `n132/arvo:<id>-vul` image tags, so nothing
-here needs a FLBench checkout, `arvo.db`, or network access to build a dataset. The
-instance set is locked; the tool that originally froze it was removed with it, and lives
-in git history if the set ever has to change.
+The archive contains exactly 900 manifests — the complete frozen input. They pin the
+archival `n132/arvo:<id>-vul` image tags, so nothing here needs a FLBench checkout,
+`arvo.db`, or network access to build a dataset.
+
+The set is **FLBench's own 900-instance eval list, verbatim**, so a result here is
+directly comparable with a published FLBench row. It replaced a balanced 500-instance
+subset; `scripts/select_eval500.py` still documents how that was chosen and why FLBench's
+distribution is skewed (heap-buffer-overflow alone is 28%), but being flatter than FLBench
+is what made those numbers incomparable, so the skew is now inherited on purpose.
+
+Changing the set again is `python -m faultloc_adapter.freeze --flbench <checkout>
+--instance-list <ids.json>`, then re-archiving. Freezing is pure metadata — crash fields
+from `arvo.db`, gold patch from `eval-patches/` — so it needs a FLBench checkout but no
+network and no containers.
 
 ### 2. Generate the diagnosis datasets
 
@@ -48,14 +58,14 @@ in git history if the set ever has to change.
 uv run faultloc-adapter
 ```
 
-This creates one 500-task Harbor dataset per condition:
+This creates one 900-task Harbor dataset per condition:
 
 | Dataset | Information available to the diagnosis model |
 | --- | --- |
-| `datasets/flbench-diagnosis-eval500-main` | Source, PoC file, sanitizer report, and PoC execution |
-| `datasets/flbench-diagnosis-eval500-ablation-static-only` | Source and PoC file only |
-| `datasets/flbench-diagnosis-eval500-ablation-no-poc-file` | Source, sanitizer report, and PoC execution |
-| `datasets/flbench-diagnosis-eval500-sanity-no-source` | Everything except source |
+| `datasets/flbench-diagnosis-eval900-main` | Source, PoC file, sanitizer report, and PoC execution |
+| `datasets/flbench-diagnosis-eval900-ablation-static-only` | Source and PoC file only |
+| `datasets/flbench-diagnosis-eval900-ablation-no-poc-file` | Source, sanitizer report, and PoC execution |
+| `datasets/flbench-diagnosis-eval900-sanity-no-source` | Everything except source |
 
 ### 3. Run each diagnosis model
 
@@ -88,10 +98,10 @@ CONFIG=$(mktemp --suffix=.yaml)
 uv run python scripts/diagnosis_config.py "$DIAGNOSIS_AGENT" "$DIAGNOSIS_MODEL" > "$CONFIG"
 
 for DATASET in \
-  flbench-diagnosis-eval500-main \
-  flbench-diagnosis-eval500-ablation-static-only \
-  flbench-diagnosis-eval500-ablation-no-poc-file \
-  flbench-diagnosis-eval500-sanity-no-source
+  flbench-diagnosis-eval900-main \
+  flbench-diagnosis-eval900-ablation-static-only \
+  flbench-diagnosis-eval900-ablation-no-poc-file \
+  flbench-diagnosis-eval900-sanity-no-source
 do
   uv run harbor run \
     -c "$CONFIG" \
@@ -112,7 +122,7 @@ on that condition. See "Egress timeout override"
 below. It also pins one attempt,
 concurrency, the retry allowlist and `environment.delete: false`; that last one
 keeps Harbor's teardown from removing the archival ARVO base and re-pulling
-roughly 3 GB per trial, which over 4 datasets x 500 instances would dominate the
+roughly 3 GB per trial, which over 4 datasets x 900 instances would dominate the
 runtime. Everything that varies between diagnosis models stays on the command
 line.
 

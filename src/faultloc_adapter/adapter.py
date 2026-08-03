@@ -83,8 +83,13 @@ DEFAULT_ALLOWED_HOSTS = (
 
 POC_TIMEOUT_SEC = 120
 
-# The locked instance set these datasets are built over (data/eval500_instance_list.json).
-INSTANCE_SET = "eval500"
+# The locked instance set these datasets are built over (data/eval900_instance_list.json).
+# This is FLBench's own 900-instance eval list, verbatim, so a result here is
+# directly comparable with a published FLBench row. It replaced a balanced 500-
+# instance subset (scripts/select_eval500.py, kept for its category analysis): that
+# set was flatter across fault types, but being flatter than FLBench is exactly what
+# makes a number not comparable to FLBench. The skew is inherited on purpose.
+INSTANCE_SET = "eval900"
 
 DATASET_ROOT = _REPO_ROOT / "datasets"
 

@@ -17,7 +17,7 @@ Harbor supplies `main.image` from `[environment] docker_image` via its own compo
 override, so this script supplies an equivalent override to run compose directly.
 
     python scripts/env_sweep.py \\
-        --tasks datasets/flbench-diagnosis-eval500-main --report sweep.json
+        --tasks datasets/flbench-diagnosis-eval900-main --report sweep.json
 """
 
 import argparse
