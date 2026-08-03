@@ -20,10 +20,13 @@ jobs_dir: jobs
 n_attempts: 1
 
 # Stage 1 never compiles -- the verifier scores prediction.json offline -- so the
-# `arvo compile` contention that caps stage 2 does not apply here. Held at 12
-# anyway: 12 concurrent ARVO containers is the load this box is measured at, and
-# stage 1 has no measurement of its own to justify going higher.
-n_concurrent_trials: 12
+# `arvo compile` contention that caps stage 2 does not apply here, and 12 (the load
+# this box is measured at) is what the machine would allow. The binding constraint
+# is upstream instead: what the model endpoint tolerates. 4 is the claude-opus-5 and
+# gpt-5.6-sol setting; glm-4.7 on Zhipu is capped lower still and must pass `-n 2`.
+# So this number is about the API, not the box -- raising it needs a rate-limit
+# observation, not a load measurement.
+n_concurrent_trials: 4
 
 # ------------------------------------------------------------ time + resources
 # Budgets live in each task.toml (agent 1800s, verifier 300s, 2 CPU, 4 GB).
