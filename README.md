@@ -62,10 +62,30 @@ This creates one 500-task Harbor dataset per condition:
 Set the Harbor agent, model, and a filesystem-safe identifier for the actual served model.
 Do not use a gateway alias as `DIAGNOSIS_ID`.
 
+`scripts/diagnosis_config.py` pins the agent into the job config **together with the
+kwargs that switch off its hosted web tools**, which are disabled by default and are not
+something the operator has to remember. They have to travel with the agent because
+hosted web search is not a shell tool: the model asks the vendor's backend to search and
+the results arrive inside the ordinary API response, over the same host the allowlist
+must permit for the model to run at all. No network policy can see it, and
+`STRIP_ARCHIVAL_GIT` does not apply. Left on, a run searches for the crash symbols and
+reads the developer patch it is about to be scored against — observed doing exactly that.
+
+Run the generated config **without `-a`**: that flag discards the config's `agents:`
+block wholesale, taking the denial with it. Passing the kwargs as `--ak` instead is worse
+— Harbor keeps only the kwargs an agent declares and silently drops the rest, so the
+codex flag handed to `claude-code` leaves web search on with nothing in the log to say so.
+
+Concurrency is per-endpoint, not per-box: `configs/diagnosis-eval.yaml` pins 4 for
+`claude-opus-5` and `gpt-5.6-sol`. `glm-4.7` on Zhipu needs `-n 2` on the command line.
+
 ```bash
 export DIAGNOSIS_AGENT=codex
 export DIAGNOSIS_MODEL=provider/model
 export DIAGNOSIS_ID=provider-model-version
+
+CONFIG=$(mktemp --suffix=.yaml)
+uv run python scripts/diagnosis_config.py "$DIAGNOSIS_AGENT" "$DIAGNOSIS_MODEL" > "$CONFIG"
 
 for DATASET in \
   flbench-diagnosis-eval500-main \
@@ -74,13 +94,14 @@ for DATASET in \
   flbench-diagnosis-eval500-sanity-no-source
 do
   uv run harbor run \
-    -c configs/diagnosis-eval.yaml \
+    -c "$CONFIG" \
     -p "datasets/$DATASET" \
-    -a "$DIAGNOSIS_AGENT" \
-    -m "$DIAGNOSIS_MODEL" \
     --job-name "$DATASET-$DIAGNOSIS_ID"
 done
 ```
+
+The generated config is `configs/diagnosis-eval.yaml` plus one `agents:` block, so
+everything below still applies and there is no second copy to keep in step.
 
 `configs/diagnosis-eval.yaml` is not optional. It carries the egress timeout
 override, without which any reproducer slower than gost's cut-off is hung up on
